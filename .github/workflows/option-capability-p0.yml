@@ -42,6 +42,7 @@ jobs:
           status=0
           python -m pytest -q --tb=short \
             back/tests/test_option_capability_p0.py \
+            back/tests/test_option_capability_security_p0.py \
             > pytest-option-p0.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
