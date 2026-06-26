@@ -15,15 +15,18 @@ from dano.execution.page.runtime import PageActionRuntime, build_page_runtime
 from dano.execution.page.scout import scout_dom, to_recorded_steps
 from dano.execution.page.option_p0 import install_option_p0
 from dano.execution.page.option_p0_compat import install_option_p0_compat
+from dano.execution.page.option_p0_compile_guard import install_option_p0_compile_guard
 from dano.execution.page.option_p0_integrity import install_option_p0_integrity
 from dano.execution.page.option_p0_quality import install_option_p0_quality
 from dano.execution.page.option_p0_security import install_option_p0_security
 
-# New recordings use complete source metadata, privacy filtering, candidate-integrity
-# checks and strict live validation; legacy GET-only assets remain executable during P0.
+# New recordings use complete source metadata, compile-time privacy filtering,
+# candidate-integrity checks and strict live validation. Legacy GET-only assets remain
+# executable during the P0 migration.
 install_option_p0()
 install_option_p0_compat()
 install_option_p0_quality()
+install_option_p0_compile_guard()
 install_option_p0_integrity()
 install_option_p0_security()
 
