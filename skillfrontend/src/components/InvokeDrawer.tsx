@@ -14,12 +14,14 @@ const STATE_COLOR: Record<string, string> = {
 
 const OPTION_READY = new Set(["ok", "empty"]);
 const OPTION_NON_ERROR = new Set(["idle", "loading", "ok", "empty"]);
+const OPTION_WAITING = new Set(["missing_dependency", "query_required", "query_too_short"]);
 
 type OptionLoadState = {
   status: string;
   message?: string;
   httpStatus?: number;
   searchSupported?: boolean;
+  validationSupported?: boolean;
   dependsOn?: string[];
   missingDependencies?: string[];
   minQueryLength?: number;
@@ -53,7 +55,7 @@ function normalizeOptions(p: JSONSchemaProperty): ToolOption[] {
     const rec = item as Record<string, unknown>;
     const label = typeof item === "object" && item !== null && "label" in rec ? String(rec.label ?? "") : String(item ?? "");
     const rawValue = typeof item === "object" && item !== null && "value" in rec ? rec.value : item;
-    const value = typeof rawValue === "number" ? rawValue : String(rawValue ?? "");
+    const value = typeof rawValue === "number" || typeof rawValue === "boolean" ? rawValue : String(rawValue ?? "");
     if (!label) continue;
     const key = `${label}\u0000${String(value)}`;
     if (seen.has(key)) continue;
@@ -70,7 +72,7 @@ function jsonSkeleton(p: JSONSchema): string {
 }
 
 function isOptionSourceFailure(state?: OptionLoadState): boolean {
-  return !!state && !OPTION_NON_ERROR.has(state.status);
+  return !!state && !OPTION_NON_ERROR.has(state.status) && !OPTION_WAITING.has(state.status);
 }
 
 export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest | null; onClose: () => void }) {
@@ -91,6 +93,9 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
   const required = useMemo(() => new Set(skill?.parameters?.required || []), [skill]);
 
   useEffect(() => {
+    for (const timer of Object.values(optionSearchTimers.current)) window.clearTimeout(timer);
+    optionSearchTimers.current = {};
+    optionRequestSeq.current = {};
     if (skill) {
       setValues({});
       setText(jsonSkeleton(skill.parameters));
@@ -101,12 +106,18 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
       setOptionLoading({});
       setOptionState({});
     }
+    return () => {
+      for (const timer of Object.values(optionSearchTimers.current)) window.clearTimeout(timer);
+      optionSearchTimers.current = {};
+      for (const field of Object.keys(optionRequestSeq.current)) optionRequestSeq.current[field] += 1;
+    };
   }, [skill]);
 
   const setVal = (k: string, v: unknown) => {
-    const dependents = Object.entries(optionState)
-      .filter(([, state]) => state.dependsOn?.includes(k))
-      .map(([field]) => field);
+    const dependents = Object.keys(props).filter((field) => {
+      const declared = props[field]?.["x-options-depends-on"] || [];
+      return declared.includes(k) || optionState[field]?.dependsOn?.includes(k);
+    });
     setValues((prev) => {
       const next = { ...prev, [k]: v };
       for (const field of dependents) delete next[field];
@@ -122,6 +133,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
         const next = { ...prev };
         for (const field of dependents) {
           next[field] = { ...prev[field], status: "idle", message: undefined, nextCursor: null, hasMore: false };
+          optionRequestSeq.current[field] = (optionRequestSeq.current[field] || 0) + 1;
         }
         return next;
       });
@@ -144,7 +156,8 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
     const append = cursor !== undefined && cursor !== null;
     if (append && optionLoading[key]) return;
     const state = optionState[key];
-    if (!force && !append && !query && OPTION_READY.has(state?.status || "") && !state?.searchSupported) return;
+    const remoteSearch = !!p?.["x-options-search"] || !!state?.searchSupported;
+    if (!force && !append && !query && OPTION_READY.has(state?.status || "") && !remoteSearch) return;
 
     const seq = (optionRequestSeq.current[key] || 0) + 1;
     optionRequestSeq.current[key] = seq;
@@ -160,10 +173,11 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
       if (optionRequestSeq.current[key] !== seq) return;
       const status = res.source_status || ((res.options || []).length ? "ok" : "empty");
       const capability = {
-        searchSupported: !!res.search_supported,
-        dependsOn: res.depends_on || [],
+        searchSupported: !!res.search_supported || !!p?.["x-options-search"],
+        validationSupported: !!res.validation_supported || !!p?.["x-options-validation"],
+        dependsOn: res.depends_on || p?.["x-options-depends-on"] || [],
         missingDependencies: res.missing_dependencies,
-        minQueryLength: res.min_query_length,
+        minQueryLength: res.min_query_length ?? p?.["x-options-min-query-length"],
         nextCursor: res.next_cursor,
         hasMore: !!res.has_more,
         total: res.total,
@@ -206,9 +220,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           ...prev,
           [key]: { status, message: detail, httpStatus: res.http_status, ...capability },
         }));
-        if (!["missing_dependency", "query_required", "query_too_short"].includes(status)) {
-          message.error(`${key}：${detail}`);
-        }
+        if (!OPTION_WAITING.has(status)) message.error(`${key}：${detail}`);
       }
     } catch (e: any) {
       if (optionRequestSeq.current[key] !== seq) return;
@@ -293,8 +305,9 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
     if (isSelectProp(p)) {
       const dynamic = !!p?.["x-options-source"];
       const state = optionState[key];
+      const sourceWaiting = dynamic && OPTION_WAITING.has(state?.status || "");
       const sourceFailed = dynamic && isOptionSourceFailure(state);
-      const sourceWaiting = dynamic && ["missing_dependency", "query_required", "query_too_short"].includes(state?.status || "");
+      const remoteSearch = !!p?.["x-options-search"] || !!state?.searchSupported;
       const options = dynamic ? (optionCache[key] || []) : normalizeOptions(p);
       const multi = isMultiSelectProp(p);
       widget = (
@@ -303,7 +316,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           showSearch
           allowClear
           optionFilterProp="label"
-          filterOption={state?.searchSupported ? false : undefined}
+          filterOption={remoteSearch ? false : undefined}
           style={{ width: "100%" }}
           value={(values[key] as any) ?? undefined}
           options={options}
@@ -319,7 +332,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           }
           onFocus={() => loadOptions(key, p)}
           onDropdownVisibleChange={(open) => { if (open) loadOptions(key, p); }}
-          onSearch={(text) => { if (state?.searchSupported) scheduleOptionSearch(key, p, text); }}
+          onSearch={(text) => { if (remoteSearch) scheduleOptionSearch(key, p, text); }}
           dropdownRender={(menu) => (
             <>
               {menu}
