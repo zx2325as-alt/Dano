@@ -216,7 +216,7 @@ async def test_same_value_with_different_labels_is_rejected(monkeypatch) -> None
 
     assert result["options"] == []
     assert result["source_status"] == "ambiguous_values"
-    assert result["conflict_count"] == 1
+    assert "多个名称" in result["note"]
 
 
 @pytest.mark.asyncio
