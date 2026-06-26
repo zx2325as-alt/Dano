@@ -12,11 +12,17 @@ publication/runtime gaps without introducing free-form expressions:
 from __future__ import annotations
 
 import copy
+from contextvars import ContextVar
 import json
 from typing import Any
 
 _INSTALLED = False
 _MAX_CONTEXT_BYTES = 64 * 1024
+_MISSING = object()
+_SUBMITTED_VALUE: ContextVar[Any] = ContextVar(
+    "dano_option_query_submitted_value",
+    default=_MISSING,
+)
 
 
 def install_option_query_p1_validation() -> None:
@@ -25,6 +31,15 @@ def install_option_query_p1_validation() -> None:
         return
 
     from dano.execution.page import option_query_p1 as p1
+
+    # The original P1 helper converts search text to str. Preserve the raw submitted
+    # value in the current async context so an exact validation binding keeps integer,
+    # boolean and structured value types intact.
+    original_submitted_query = p1._submitted_query
+
+    def submitted_query_preserving_type(value: Any) -> str:
+        _SUBMITTED_VALUE.set(value)
+        return original_submitted_query(value)
 
     original_prepare = p1._prepare_select
 
@@ -85,7 +100,11 @@ def install_option_query_p1_validation() -> None:
         if not isinstance(validation_spec, dict):
             raise p1.OptionQueryError("invalid_query_protocol", "validation 必须是对象")
 
-        exact_value = p1._unwrap_value(query)
+        raw_submitted = _SUBMITTED_VALUE.get()
+        _SUBMITTED_VALUE.set(_MISSING)
+        if raw_submitted is _MISSING:
+            raw_submitted = query
+        exact_value = p1._unwrap_value(raw_submitted)
         if exact_value in (None, "", []):
             raise p1.OptionQueryError(
                 "validation_unsupported",
@@ -119,6 +138,7 @@ def install_option_query_p1_validation() -> None:
             return {}
         return original_page_info(select, data)
 
+    p1._submitted_query = submitted_query_preserving_type
     p1._prepare_select = prepare_select_validated
     p1._response_page_info = response_page_info_validated
     _INSTALLED = True
