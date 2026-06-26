@@ -281,10 +281,8 @@ async def test_array_validation_searches_each_submitted_value() -> None:
     )
 
     assert [call["json"]["keyword"] for call in Client.calls] == ["张经理", "李经理"]
-    assert overrides[("approvers",)] == [
-        {"id": 1, "name": "张经理"},
-        {"id": 2, "name": "李经理"},
-    ]
+    # Existing array binding intentionally emits only target request fields.
+    assert overrides[("approvers",)] == [{"id": 1}, {"id": 2}]
 
 
 @pytest.mark.asyncio
