@@ -14,6 +14,10 @@ on:
       - "skillfrontend/**"
       - ".github/workflows/option-inference-p2.yml"
 
+concurrency:
+  group: option-inference-p2-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
