@@ -46,6 +46,10 @@ export interface JSONSchemaProperty {
   "x-submit-mode"?: "value" | string;
   "x-option-label"?: string;
   "x-option-value"?: string;
+  "x-options-protocol"?: string;
+  "x-options-search"?: boolean;
+  "x-options-page-size"?: number;
+  "x-option-depends-on"?: string[];
 }
 
 export interface ToolOption {
@@ -65,6 +69,11 @@ export type OptionSourceStatus =
   | "network_error"
   | "invalid_response"
   | "invalid_shape"
+  | "invalid_cursor"
+  | "needs_context"
+  | "invalid_request"
+  | "unsupported_method"
+  | "source_conflict"
   | "source_error";
 
 export interface ToolOptionsResponse {
@@ -75,6 +84,18 @@ export interface ToolOptionsResponse {
   source_status?: OptionSourceStatus | string;
   http_status?: number;
   note?: string;
+  protocol_version?: string;
+  returned?: number;
+  has_more?: boolean;
+  next_cursor?: string | null;
+  dependencies?: string[];
+}
+
+export interface ToolOptionsQuery {
+  query?: string;
+  context?: Record<string, unknown>;
+  limit?: number;
+  cursor?: string | null;
 }
 
 // 与后端 TaskOutcome 对齐(部分字段)
@@ -119,9 +140,13 @@ export async function invokeSkill(
   return data;
 }
 
-export async function listSkillOptions(skillId: string, field: string): Promise<ToolOptionsResponse> {
+export async function listSkillOptions(
+  skillId: string,
+  field: string,
+  query: ToolOptionsQuery = {},
+): Promise<ToolOptionsResponse> {
   const toolName = skillId.split(".").join("__");
-  const { data } = await api.post("/v1/tools/options", { name: toolName, field });
+  const { data } = await api.post("/v1/tools/options", { name: toolName, field, ...query });
   return data;
 }
 
