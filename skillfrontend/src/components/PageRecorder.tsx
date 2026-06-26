@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Card, Form, Input, Button, Space, Typography, Alert, Tag, List, Checkbox, Collapse, Switch, message } from "antd";
 import { useNavigate } from "react-router-dom";
+import OptionInferenceSummary, { OptionQueryInferenceView, OptionQueryProtocolView } from "./OptionInferenceSummary";
 
 // 方式B:网页内录制。连 WebSocket → 后端托管浏览器,画面投到这里,点击/键盘回传,实时显示捕获的步骤。
 // 客户全程免安装、免命令行。
@@ -14,7 +15,10 @@ interface RecField { path: string; key: string; value: string; suggest_param: bo
 // 候选写请求(抓到多个时让用户手选用哪个)
 interface RecCand { idx: number; method: string; path: string }
 // P3:字段=选自某列表(展示 label、提交 value)/ 字段=当前用户·会话值(运行期重取)
-interface RecSelect { path: string; source_url: string; value_key: string; label_key: string; label: string; count: number }
+interface RecSelect {
+  path: string; source_url: string; value_key: string; label_key: string; label: string; count: number;
+  option_query?: OptionQueryProtocolView; option_query_inference?: OptionQueryInferenceView;
+}
 interface RecIdentity { path: string; source: string }
 interface RecResult {
   ok?: boolean; action?: string; risk_level?: string; mode?: string; reason?: string;
@@ -279,7 +283,7 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
                 <Alert type="warning" showIcon style={{ marginBottom: 8 }}
                   message={<span>
                     {Object.keys(selects).length > 0 && <span><Tag color="purple">📋 选自列表</Tag>
-                    l、提交 value,运行期回填目标系统值;</span>}
+                    展示 label、提交 value，运行期回填目标系统值;</span>}
                     {Object.keys(identity).length > 0 && <span><Tag color="gold">🔒 当前用户</Tag>
                      </span>}
                      
@@ -323,8 +327,12 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
                       <Space size={8} wrap>
                         <Checkbox checked={p.on} onChange={(e) => toggleField(f.path, e.target.checked)}>参数</Checkbox>
                         <Typography.Text code style={{ fontSize: 12 }}>{f.path}</Typography.Text>
-                        {sel && <Tag color="purple" style={{ fontSize: 11 }}>
-                          📋 选自列表 {sel.label_key}→{sel.value_key}(共{sel.count}项)</Tag>}
+                        {sel && <>
+                          <Tag color="purple" style={{ fontSize: 11 }}>
+                            📋 选自列表 {sel.label_key}→{sel.value_key}(共{sel.count}项)
+                          </Tag>
+                          <OptionInferenceSummary select={sel} />
+                        </>}
                         {idn && <Tag color="gold" style={{ fontSize: 11 }}>🔒 当前用户/会话值(运行期自动填)</Tag>}
                         {!sel && !idn && (f.suggest_param
                           ? <Tag color="blue" style={{ fontSize: 11 }}>参数·agent 传值</Tag>
