@@ -1,22 +1,25 @@
 """P0 data-quality and privacy rules for dynamic option sources.
 
-This module keeps the compatibility rollout narrow while preventing three common
-production failures:
+This module keeps the compatibility rollout narrow while preventing common production
+failures:
 
 * secrets in a recorded POST body being persisted into a Skill;
 * a non-empty response being misreported as an empty enum because label/value keys
   drifted;
-* duplicate or conflicting values making a selection ambiguous.
+* duplicate or conflicting values making a selection ambiguous;
+* a candidate source losing the target-system origin needed for safe runtime replay;
+* unbounded candidate payloads exhausting the UI or runtime.
 """
 from __future__ import annotations
 
 import copy
 import json
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 _INSTALLED = False
 _MAX_SOURCE_ITEMS = 10_000
 _MAX_RETURNED_OPTIONS = 500
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _REDACTED = "__DANO_REDACTED__"
 _SENSITIVE_KEY_PARTS = (
     "password",
@@ -119,6 +122,60 @@ def _stable_value(value) -> str:
         return repr(value)
 
 
+def _origin_base(url: object) -> str:
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    port = parsed.port or default_port
+    suffix = "" if port == default_port else f":{port}"
+    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{suffix}"
+
+
+def _bind_target_origin(compiled: dict | None) -> dict | None:
+    if not isinstance(compiled, dict):
+        return compiled
+    origin = _origin_base(compiled.get("url"))
+    if not origin:
+        return compiled
+    for select in compiled.get("selects") or []:
+        if isinstance(select, dict):
+            select.setdefault("source_target_origin", origin)
+    return compiled
+
+
+def _target_origin_for_field(api_request: dict, field: str | None = None) -> str:
+    requests = list(api_request.get("steps") or []) if isinstance(api_request, dict) else []
+    if not requests:
+        requests = [api_request or {}]
+    for request in requests:
+        selects = request.get("selects") or [] if isinstance(request, dict) else []
+        if field is None or any(str(item.get("param")) == str(field) for item in selects if isinstance(item, dict)):
+            explicit = next(
+                (
+                    str(item.get("source_target_origin") or "")
+                    for item in selects
+                    if isinstance(item, dict)
+                    and (field is None or str(item.get("param")) == str(field))
+                    and item.get("source_target_origin")
+                ),
+                "",
+            )
+            if explicit:
+                return explicit
+            origin = _origin_base(request.get("url") if isinstance(request, dict) else "")
+            if origin:
+                return origin
+    return _origin_base((api_request or {}).get("url"))
+
+
+def _json_size_bytes(data) -> int:
+    try:
+        return len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _normalize_option_result(result: dict, requested_limit: int) -> dict:
     status = str(result.get("source_status") or "")
     if status not in {"ok", "empty"}:
@@ -186,6 +243,26 @@ def install_option_p0_quality() -> None:
     def suggest_selects_quality(post_data: str | None, reads: list[dict], samples: dict | None = None):
         return [_sanitize_select(item) for item in (original_suggest_selects(post_data, reads, samples) or [])]
 
+    original_build_api_request = rc.build_api_request
+
+    def build_api_request_quality(*args, **kwargs):
+        return _bind_target_origin(original_build_api_request(*args, **kwargs))
+
+    original_request_source_json = option_p0._request_source_json
+
+    async def request_source_json_quality(*args, **kwargs):
+        data, status = await original_request_source_json(*args, **kwargs)
+        if status.get("ok"):
+            payload_size = _json_size_bytes(data)
+            if payload_size > _MAX_RESPONSE_BYTES:
+                return None, {
+                    "ok": False,
+                    "status": status.get("status", 200),
+                    "source_status": "response_too_large",
+                    "message": f"候选来源响应约 {payload_size} 字节，超过安全上限 {_MAX_RESPONSE_BYTES}",
+                }
+        return data, status
+
     original_fetch_options = option_p0._fetch_options
 
     async def fetch_options_quality(*args, **kwargs):
@@ -212,10 +289,11 @@ def install_option_p0_quality() -> None:
         limit: int = _MAX_RETURNED_OPTIONS,
     ) -> dict:
         safe_limit = max(1, min(int(limit or _MAX_RETURNED_OPTIONS), _MAX_RETURNED_OPTIONS))
+        effective_base_url = base_url or _target_origin_for_field(api_request, field)
         result = await original_fetch_field_options(
             api_request,
             field,
-            base_url=base_url,
+            base_url=effective_base_url,
             storage_state=storage_state,
             token_key=token_key,
             verify=verify,
@@ -223,7 +301,31 @@ def install_option_p0_quality() -> None:
         )
         return _normalize_option_result(result, safe_limit)
 
+    original_resolve_selects = rc._resolve_selects
+
+    async def resolve_selects_quality(
+        api_request: dict,
+        fields: dict,
+        *,
+        base_url: str,
+        storage_state,
+        token_key: str | None,
+        verify: bool,
+    ):
+        effective_base_url = base_url or _target_origin_for_field(api_request)
+        return await original_resolve_selects(
+            api_request,
+            fields,
+            base_url=effective_base_url,
+            storage_state=storage_state,
+            token_key=token_key,
+            verify=verify,
+        )
+
     rc.suggest_selects = suggest_selects_quality
+    rc.build_api_request = build_api_request_quality
+    option_p0._request_source_json = request_source_json_quality
     option_p0._fetch_options = fetch_options_quality
     rc.fetch_field_options = fetch_field_options_quality
+    rc._resolve_selects = resolve_selects_quality
     _INSTALLED = True
