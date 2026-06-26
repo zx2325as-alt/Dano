@@ -1,5 +1,6 @@
 from pathlib import Path
 
+# One-shot exact codemod. The paired workflow removes this file after applying it.
 path = Path("back/dano/catalog/manifest.py")
 text = path.read_text(encoding="utf-8")
 anchor = '''    return opts
