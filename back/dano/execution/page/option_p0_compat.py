@@ -2,8 +2,8 @@
 
 New recordings carry method/body/records-path metadata and use the strict P0 runtime.
 Legacy assets only contain ``source_url`` and historically relied on ``_fetch_list``;
-keep that behavior so existing Skills and callers are not forced onto an unverifiable
-request shape during the P0 rollout.
+keep that request behavior while applying the same origin and credential safety checks
+used for newly recorded sources.
 """
 from __future__ import annotations
 
@@ -51,9 +51,21 @@ def install_option_p0_compat() -> None:
                 auth_headers=auth_headers,
             )
 
+        # Import lazily because the compatibility layer is installed before the final
+        # security wrapper. Legacy requests must not bypass origin or credential checks.
+        from dano.execution.page.option_p0_security import (
+            _effective_base_url,
+            _validate_source_request,
+        )
+
+        effective_base_url = _effective_base_url(select, base_url)
+        violation = _validate_source_request(select, effective_base_url)
+        if violation is not None:
+            return [], violation
+
         items = await rc._fetch_list(
             select.get("source_url") or "",
-            base_url,
+            effective_base_url,
             storage_state,
             token_key,
             verify,

@@ -54,7 +54,7 @@ export interface JSONSchemaProperty {
 
 export interface ToolOption {
   label: string;
-  value: string | number;
+  value: string | number | boolean;
 }
 
 export type OptionSourceStatus =
@@ -65,18 +65,32 @@ export type OptionSourceStatus =
   | "permission_denied"
   | "source_not_found"
   | "source_unavailable"
+  | "source_conflict"
   | "rate_limited"
   | "network_error"
+  | "invalid_request"
   | "invalid_response"
   | "invalid_shape"
+  | "invalid_mapping"
+  | "invalid_source_url"
+  | "invalid_base_url"
   | "invalid_cursor"
-  | "needs_context"
   | "invalid_context"
   | "invalid_binding"
-  | "invalid_request"
+  | "needs_context"
+  | "credential_in_url"
+  | "sensitive_request"
+  | "cross_origin_blocked"
+  | "unsafe_method"
   | "unsupported_method"
-  | "source_conflict"
+  | "mixed_candidate_shape"
+  | "ambiguous_records"
+  | "ambiguous_values"
+  | "ambiguous_labels"
+  | "too_many_options"
+  | "response_too_large"
   | "source_error";
+
 
 export interface ToolOptionsResponse {
   field: string;
@@ -92,7 +106,12 @@ export interface ToolOptionsResponse {
   has_more?: boolean;
   next_cursor?: string | null;
   dependencies?: string[];
+  truncated?: boolean;
+  deduplicated_count?: number;
+  invalid_item_count?: number;
+  conflict_count?: number;
 }
+
 
 export interface ToolOptionsQuery {
   query?: string;
