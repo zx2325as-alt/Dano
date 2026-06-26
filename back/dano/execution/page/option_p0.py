@@ -2,7 +2,7 @@
 
 This module is intentionally additive: it patches the legacy request-capture runtime at
 package import time so existing assets keep working while new recordings preserve the
-real option-source method and request template.
+real option-source request and fail closed when live candidates cannot be verified.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ def _source_error(status: int, detail: str = "") -> tuple[str, str]:
         return "permission_denied", "当前账号没有读取候选项的权限"
     if status == 404:
         return "source_not_found", "候选来源接口不存在或已变更"
+    if status == 429:
+        return "rate_limited", "候选来源请求过于频繁，请稍后重试"
     if status >= 500:
         return "source_unavailable", "候选来源服务暂时不可用"
     return "source_error", detail or (f"候选来源请求失败（HTTP {status}）" if status else "候选来源请求失败")
@@ -31,23 +33,81 @@ def _source_spec(sel: dict) -> dict:
         "post_data": sel.get("source_post_data"),
         "content_type": sel.get("source_content_type") or "application/json",
         "query": sel.get("source_query") or {},
+        "auth_headers": sel.get("source_auth_headers") or {},
+        "records_path": sel.get("source_records_path") or [],
     }
+
+
+def _find_list_path(data) -> list[str | int] | None:
+    """Find the recorded option-list path, including an empty list when the key is known."""
+    from dano.execution.page import request_capture as rc
+
+    if isinstance(data, list):
+        return []
+    if not isinstance(data, dict):
+        return None
+    for key in rc._LIST_KEYS:
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, list):
+            return [key]
+        if isinstance(value, dict):
+            for child_key in rc._LIST_KEYS:
+                child = value.get(child_key)
+                if isinstance(child, list):
+                    return [key, child_key]
+    for key, value in data.items():
+        if isinstance(value, list) and (not value or isinstance(value[0], (dict, str, int, float))):
+            return [key]
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                if isinstance(child, list) and (not child or isinstance(child[0], (dict, str, int, float))):
+                    return [key, child_key]
+    return None
+
+
+def _get_path(data, path: list[str | int]):
+    current = data
+    for token in path:
+        if isinstance(token, int):
+            if not isinstance(current, list) or token < 0 or token >= len(current):
+                return None
+            current = current[token]
+        else:
+            if not isinstance(current, dict) or token not in current:
+                return None
+            current = current[token]
+    return current
+
+
+def _extract_option_items(data, records_path: list[str | int] | None) -> list | None:
+    """Extract options without confusing a legitimate empty list with schema drift."""
+    if records_path is not None:
+        value = _get_path(data, records_path)
+        return value if isinstance(value, list) else None
+    path = _find_list_path(data)
+    if path is None:
+        return None
+    value = _get_path(data, path)
+    return value if isinstance(value, list) else None
 
 
 async def _request_source_json(sel: dict, *, base_url: str, storage_state, token_key: str | None,
                                verify: bool, auth_headers: dict | None) -> tuple[object | None, dict]:
-    """Replay an option source using its recorded HTTP method/body instead of forcing GET."""
+    """Replay an option source using its recorded method, body, content type and safe headers."""
     from dano.execution.page import request_capture as rc
 
     spec = _source_spec(sel)
     raw_url = spec["url"]
     full = raw_url if raw_url.startswith("http") else (base_url or "").rstrip("/") + raw_url
     host = urlparse(full).hostname or ""
-    headers = dict(auth_headers or {})
+    # Source-specific non-browser headers first; the current runtime token/header set wins.
+    headers = {**spec["auth_headers"], **(auth_headers or {})}
     session_headers = rc._auth_headers(storage_state, host, token_key)
     if session_headers.get("Cookie"):
         headers["Cookie"] = session_headers["Cookie"]
-    if "Authorization" not in headers and not (auth_headers or {}) and session_headers.get("Authorization"):
+    if "Authorization" not in headers and session_headers.get("Authorization"):
         headers["Authorization"] = session_headers["Authorization"]
 
     method = spec["method"]
@@ -106,7 +166,37 @@ def _enrich_select_sources(original):
                 sel["source_post_data"] = read.get("post_data")
             if read.get("content_type"):
                 sel["source_content_type"] = read.get("content_type")
+            if read.get("auth_headers"):
+                sel["source_auth_headers"] = read.get("auth_headers")
+            records_path = _find_list_path(read.get("json"))
+            if records_path is not None:
+                sel["source_records_path"] = records_path
         return selects
+    return wrapped
+
+
+def _capture_read_request_metadata(original):
+    async def wrapped(self, response) -> None:  # noqa: ANN001
+        await original(self, response)
+        try:
+            from dano.execution.page import request_capture as rc
+
+            request = response.request
+            method = (request.method or "").upper()
+            url = response.url
+            headers = dict(request.headers or {})
+            post_data = request.post_data if method in ("POST", "PUT", "PATCH") else None
+            for read in reversed(self.reads):
+                if read.get("method") != method or read.get("url") != url:
+                    continue
+                read["post_data"] = post_data
+                read["content_type"] = headers.get("content-type", "")
+                safe_headers = rc.extract_auth_headers(headers)
+                if safe_headers:
+                    read["auth_headers"] = safe_headers
+                break
+        except Exception:  # noqa: BLE001
+            pass
     return wrapped
 
 
@@ -119,10 +209,10 @@ async def _fetch_options(sel: dict, *, base_url: str, storage_state, token_key: 
                                               auth_headers=auth_headers)
     if not status["ok"]:
         return [], status
-    items = rc.as_list_payload(data)
+    items = _extract_option_items(data, _source_spec(sel)["records_path"] or None)
     if items is None:
         return [], {"ok": False, "status": status["status"], "source_status": "invalid_shape",
-                    "message": "候选来源响应中未找到可用列表，接口结构可能已变化"}
+                    "message": "候选来源响应结构已变化，无法定位候选列表"}
     items = rc._apply_option_filter(items, sel.get("option_filter"))
     return items, status
 
@@ -155,8 +245,11 @@ async def fetch_field_options(api_request: dict, field: str, *, base_url: str = 
             options.append({"label": label, "value": rc._option_value(item.get(vk))})
         if len(options) >= limit:
             break
+    source_status = "ok" if options else "empty"
     out = {"field": field, "options": options, "count": len(items), "submit_mode": mode,
-           "label_key": lk, "value_key": vk, "source_status": "ok"}
+           "label_key": lk, "value_key": vk, "source_status": source_status}
+    if source_status == "empty":
+        out["note"] = "当前条件下没有可选项"
     if sel.get("option_filter"):
         out["option_filter"] = sel.get("option_filter")
     return out
@@ -211,9 +304,14 @@ def install_option_p0() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
+    from dano.execution.page import recorder as recorder_module
     from dano.execution.page import request_capture as rc
 
     rc.suggest_selects = _enrich_select_sources(rc.suggest_selects)
     rc.fetch_field_options = fetch_field_options
     rc._resolve_selects = resolve_selects
+    if not getattr(recorder_module.RecordSession._on_response, "__dano_option_p0__", False):
+        patched = _capture_read_request_metadata(recorder_module.RecordSession._on_response)
+        patched.__dano_option_p0__ = True
+        recorder_module.RecordSession._on_response = patched
     _INSTALLED = True
