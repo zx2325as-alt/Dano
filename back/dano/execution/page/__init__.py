@@ -20,11 +20,12 @@ from dano.execution.page.option_p0_integrity import install_option_p0_integrity
 from dano.execution.page.option_p0_quality import install_option_p0_quality
 from dano.execution.page.option_p0_security import install_option_p0_security
 from dano.execution.page.option_query_p1 import install_option_query_p1
+from dano.execution.page.option_query_p1_validation import install_option_query_p1_validation
 from dano.execution.page.option_query_p1_contract import install_option_query_p1_contract
 
 # P0 establishes safe replay and fail-closed candidate integrity. P1 is installed after
-# every P0 gate; the public capability projection is installed last so success and
-# intentional waiting states expose the same stable contract.
+# every P0 gate, then receives deterministic protocol validation. The public capability
+# projection is installed last so success and intentional waiting states share one contract.
 install_option_p0()
 install_option_p0_compat()
 install_option_p0_quality()
@@ -32,6 +33,7 @@ install_option_p0_compile_guard()
 install_option_p0_integrity()
 install_option_p0_security()
 install_option_query_p1()
+install_option_query_p1_validation()
 install_option_query_p1_contract()
 
 __all__ = ["FakePageDriver", "PageDriver", "PageActionRuntime", "build_page_runtime",
