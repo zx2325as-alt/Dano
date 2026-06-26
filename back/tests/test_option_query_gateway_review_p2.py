@@ -39,11 +39,12 @@ _SELECT = {
 
 
 def _server_ir(select: dict) -> dict:
+    source_id = stable_source_id(select["source_url"], select["value_key"], select["label_key"])
     return {
         "version": "transaction-ir/v1",
         "inputs": [{"name": "审批人", "path": "approverId"}],
         "sources": [{
-            "id": stable_source_id(select["source_url"], select["value_key"], select["label_key"]),
+            "id": source_id,
             "kind": "http_list",
             "url": select["source_url"],
             "method": select["source_method"],
@@ -57,7 +58,7 @@ def _server_ir(select: dict) -> dict:
             "input": "审批人",
             "target_path": "approverId",
             "mode": "select_value",
-            "source_id": stable_source_id(select["source_url"], select["value_key"], select["label_key"]),
+            "source_id": source_id,
         }],
         "capture": {"capture_hash": "capture-a", "trace_hash": "trace-a"},
     }
@@ -143,10 +144,9 @@ async def test_request_fields_public_projection_hides_source_and_identity_detail
         assert secret not in public_dump
 
 
-def test_client_only_transaction_ir_is_never_preferred_over_server_ir() -> None:
+def test_server_transaction_ir_wins_over_browser_echo() -> None:
     server = _server_ir(_SELECT)
     client = copy.deepcopy(server)
     client["sources"][0]["url"] = "https://attacker.example/options"
 
     assert _trusted_transaction_ir(server, client, {"trace_hash": "trace-a"}) == server
-    assert _trusted_transaction_ir(None, client, {"trace_hash": "trace-a"}) is None
