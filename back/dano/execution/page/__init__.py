@@ -13,6 +13,11 @@ from __future__ import annotations
 from dano.execution.page.driver import FakePageDriver, PageDriver
 from dano.execution.page.runtime import PageActionRuntime, build_page_runtime
 from dano.execution.page.scout import scout_dom, to_recorded_steps
+from dano.execution.page.option_p0 import install_option_p0
+
+# P0: dynamic option sources replay their recorded HTTP method/body and fail closed.
+# Kept as an additive compatibility layer so legacy assets still default to GET.
+install_option_p0()
 
 __all__ = ["FakePageDriver", "PageDriver", "PageActionRuntime", "build_page_runtime",
            "scout_dom", "to_recorded_steps"]
