@@ -61,6 +61,7 @@ jobs:
             back/tests/test_option_query_review_ir_p2.py \
             back/tests/test_option_query_gateway_review_p2.py \
             back/tests/test_option_reference_p3.py \
+            back/tests/test_option_reference_orchestrator_p3.py \
             > pytest-option-reference-p3.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
@@ -77,7 +78,7 @@ jobs:
       - name: Report backend failure
         if: steps.backend_tests.outcome != 'success'
         run: |
-          tail -n 520 pytest-option-reference-p3.log
+          tail -n 560 pytest-option-reference-p3.log
           exit 1
 
   frontend:
