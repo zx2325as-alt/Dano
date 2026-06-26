@@ -11,7 +11,7 @@ import copy
 import hashlib
 import json
 import time
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 from dano.execution.page.option_reference_p3 import (
@@ -168,23 +168,25 @@ async def _issue_option_references(
     expires_at = time.time() + reference_ttl_seconds()
     fingerprint = source_fingerprint(select)
     context_digest = _context_hash(select, context)
-    store = get_option_reference_store()
-    public_options: list[dict] = []
-    for option in options:
-        if not isinstance(option, dict) or "value" not in option:
-            continue
-        label = str(option.get("label") or "")
-        token = await store.issue(OptionReferenceRecord(
+    valid_options = [option for option in options if isinstance(option, dict) and "value" in option]
+    records = [
+        OptionReferenceRecord(
             tenant=tenant,
             skill_id=skill_id,
             field=field,
             source_fingerprint=fingerprint,
             value=copy.deepcopy(option.get("value")),
-            label=label,
+            label=str(option.get("label") or ""),
             context_hash=context_digest,
             expires_at=expires_at,
-        ))
-        public_options.append({"label": label, "value": token})
+        )
+        for option in valid_options
+    ]
+    tokens = await get_option_reference_store().issue_many(records)
+    public_options = [
+        {"label": record.label, "value": token}
+        for record, token in zip(records, tokens)
+    ]
     out = copy.deepcopy(result)
     out["options"] = public_options
     out["count"] = len(public_options)
