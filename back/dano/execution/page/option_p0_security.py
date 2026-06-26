@@ -5,7 +5,7 @@ module enforces the narrow read contract expected from an option source:
 
 * only GET and POST are accepted;
 * only HTTP(S) absolute URLs are accepted;
-* credentials embedded in a URL are rejected;
+* credentials embedded in a URL or query string are rejected;
 * credentials embedded in a recorded request body are rejected;
 * the option source must stay on the target system origin whenever that origin is known.
 
@@ -55,6 +55,24 @@ def _validate_source_request(select: dict, base_url: str) -> dict | None:
             "source_status": "sensitive_request",
             "message": "候选来源请求体包含凭证或验证码字段，已禁止重放",
             "sensitive_keys": sensitive_keys,
+        }
+
+    if select.get("source_url_had_credentials"):
+        return {
+            "ok": False,
+            "status": 0,
+            "source_status": "credential_in_url",
+            "message": "候选来源 URL 原本包含用户名或密码，脱敏后仍禁止重放",
+        }
+
+    sensitive_query_keys = list(select.get("source_sensitive_query_keys") or [])
+    if sensitive_query_keys:
+        return {
+            "ok": False,
+            "status": 0,
+            "source_status": "sensitive_request",
+            "message": "候选来源 URL 查询参数包含凭证字段，已禁止重放",
+            "sensitive_keys": sensitive_query_keys,
         }
 
     raw_url = str(select.get("source_url") or "").strip()
