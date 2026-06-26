@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 _INSTALLED = False
 _REDACTED = "__DANO_REDACTED__"
+_EXTRA_SENSITIVE_KEYS = ("api_key", "apikey", "access_key", "accesskey")
 
 
 def _sanitize_source_url(url: object) -> tuple[str, dict]:
@@ -22,17 +23,18 @@ def _sanitize_source_url(url: object) -> tuple[str, dict]:
         return raw, {}
     try:
         parsed = urlsplit(raw)
+        hostname = parsed.hostname
+        port = parsed.port
     except ValueError:
         return raw, {"source_url_invalid": True}
 
     markers: dict = {}
-    hostname = parsed.hostname
     netloc = parsed.netloc
     if parsed.username is not None or parsed.password is not None:
         markers["source_url_had_credentials"] = True
         if hostname:
             host = f"[{hostname}]" if ":" in hostname else hostname
-            netloc = f"{host}:{parsed.port}" if parsed.port else host
+            netloc = f"{host}:{port}" if port else host
         else:
             netloc = ""
 
@@ -81,7 +83,13 @@ def install_option_p0_compile_guard() -> None:
     if _INSTALLED:
         return
 
+    from dano.execution.page import option_p0_quality
     from dano.execution.page import request_capture as rc
+
+    # Extend the common key classifier once so URL, form and JSON body handling agree.
+    for key in _EXTRA_SENSITIVE_KEYS:
+        if key not in option_p0_quality._SENSITIVE_KEY_PARTS:
+            option_p0_quality._SENSITIVE_KEY_PARTS += (key,)
 
     original_suggest_selects = rc.suggest_selects
 
