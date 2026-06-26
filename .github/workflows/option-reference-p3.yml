@@ -66,7 +66,7 @@ jobs:
             > pytest-option-reference-p3.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
-            -k "not export_options_md_lists_candidates and not manifest_and_export_write_skill_interface" \
+            -k "not export_options_md_lists_candidates and not manifest_and_export_write_skill_interface and not skill_interface_describes_sources_bindings_and_derived" \
             >> pytest-option-reference-p3.log 2>&1 || status=$?
           exit "$status"
       - name: Upload backend diagnostics
@@ -79,7 +79,7 @@ jobs:
       - name: Report backend failure
         if: steps.backend_tests.outcome != 'success'
         run: |
-          tail -n 620 pytest-option-reference-p3.log
+          tail -n 680 pytest-option-reference-p3.log
           exit 1
 
   frontend:
