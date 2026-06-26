@@ -10,6 +10,8 @@ import hashlib
 import json
 from typing import Any
 
+from dano.execution.page.transaction_ir import stable_source_id
+
 _DECISIONS = {"accept", "reject"}
 
 
@@ -168,6 +170,37 @@ def apply_option_review_decisions(server_selects: list[dict] | None, decisions: 
     for select in selects:
         select.pop("_option_review_id", None)
     return selects
+
+
+def synchronize_transaction_ir(ir: dict | None, reviewed_selects: list[dict] | None) -> dict | None:
+    """Keep Transaction IR and compiled select metadata equivalent after review."""
+    if not isinstance(ir, dict):
+        return None
+    out = copy.deepcopy(ir)
+    by_source_id: dict[str, dict] = {}
+    for select in reviewed_selects or []:
+        source_id = stable_source_id(
+            select.get("source_url"),
+            select.get("value_key"),
+            select.get("label_key"),
+        )
+        by_source_id[source_id] = select
+
+    for source in out.get("sources") or []:
+        select = by_source_id.get(str(source.get("id") or ""))
+        if select is None:
+            continue
+        protocol = select.get("option_query")
+        inference = select.get("option_query_inference")
+        if protocol:
+            source["query_protocol"] = copy.deepcopy(protocol)
+        else:
+            source.pop("query_protocol", None)
+        if inference:
+            source["inference"] = copy.deepcopy(inference)
+        else:
+            source.pop("inference", None)
+    return out
 
 
 def trusted_identity(identity: list[dict] | None) -> list[dict]:
