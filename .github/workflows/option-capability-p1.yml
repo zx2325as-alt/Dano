@@ -1,0 +1,61 @@
+name: Option Capability P1
+
+on:
+  pull_request:
+    paths:
+      - "back/**"
+      - "skillfrontend/**"
+      - ".github/workflows/option-capability-p1.yml"
+  push:
+    branches:
+      - "fix/option-capability-p1"
+    paths:
+      - "back/**"
+      - "skillfrontend/**"
+      - ".github/workflows/option-capability-p1.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: back
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: back/pyproject.toml
+      - name: Install focused backend test dependencies
+        run: >-
+          python -m pip install -q
+          pytest pytest-asyncio httpx structlog
+          fastapi pydantic pydantic-settings pyyaml
+      - name: Run P0 and P1 option tests
+        run: |
+          python -m pytest -q --tb=short \
+            back/tests/test_option_capability_p0.py \
+            back/tests/test_option_capability_p1.py
+          python -m pytest -q --tb=short \
+            back/tests/test_request_capture.py \
+            -k "not export_options_md_lists_candidates and not manifest_and_export_write_skill_interface"
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: skillfrontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: skillfrontend/package-lock.json
+      - name: Install frontend
+        run: npm ci
+      - name: Type-check and build frontend
+        run: npm run build
