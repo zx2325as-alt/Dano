@@ -35,13 +35,32 @@ jobs:
           pytest pytest-asyncio httpx structlog
           fastapi pydantic pydantic-settings pyyaml
       - name: Run P0 and P1 option tests
+        id: backend_tests
+        continue-on-error: true
+        shell: bash
         run: |
+          status=0
           python -m pytest -q --tb=short \
             back/tests/test_option_capability_p0.py \
-            back/tests/test_option_capability_p1.py
+            back/tests/test_option_capability_p1.py \
+            > pytest-option-p1.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
-            -k "not export_options_md_lists_candidates and not manifest_and_export_write_skill_interface"
+            -k "not export_options_md_lists_candidates and not manifest_and_export_write_skill_interface" \
+            >> pytest-option-p1.log 2>&1 || status=$?
+          exit "$status"
+      - name: Upload backend test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-option-p1
+          path: pytest-option-p1.log
+          if-no-files-found: error
+      - name: Report backend test failure
+        if: steps.backend_tests.outcome != 'success'
+        run: |
+          tail -n 200 pytest-option-p1.log
+          exit 1
 
   frontend:
     runs-on: ubuntu-latest
