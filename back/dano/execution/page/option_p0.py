@@ -449,6 +449,7 @@ async def _fetch_options(sel: dict, *, base_url: str, storage_state, token_key: 
             "source_status": "invalid_shape",
             "message": "候选来源响应结构已变化，无法定位候选列表",
         }
+    status["raw_count"] = len(items)
     items = rc._apply_option_filter(items, sel.get("option_filter"))
     return items, status
 

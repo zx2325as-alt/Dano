@@ -117,12 +117,25 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
     }
   };
 
+  const dependentOptionFields = (changed: string): string[] => {
+    const result = new Set<string>();
+    const queue = [changed];
+    while (queue.length) {
+      const current = queue.shift() as string;
+      for (const [field, prop] of Object.entries(props)) {
+        if (field === changed || result.has(field)) continue;
+        if ((prop?.["x-option-depends-on"] || []).includes(current)) {
+          result.add(field);
+          queue.push(field);
+        }
+      }
+    }
+    return [...result];
+  };
+
   const setVal = (key: string, value: unknown) => {
     setValues((prev) => ({ ...prev, [key]: value }));
-    const dependents = Object.entries(props)
-      .filter(([field, prop]) => field !== key && (prop?.["x-option-depends-on"] || []).includes(key))
-      .map(([field]) => field);
-    clearOptionFields(dependents);
+    clearOptionFields(dependentOptionFields(key));
   };
 
   const mergeOptions = (current: ToolOption[], incoming: ToolOption[]): ToolOption[] => {
@@ -265,7 +278,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
   }
 
   const fieldRow = (key: string, p: JSONSchemaProperty) => {
-    const label = p.description || key;
+    const label = p.label || p.description || key;
     const hint = `${key} ${label}`;
     const reqMark = required.has(key) ? <span style={{ color: "#cf1322" }}> *</span> : null;
     let widget;

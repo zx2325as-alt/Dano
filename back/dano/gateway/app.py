@@ -1012,8 +1012,8 @@ async def call_tool(req: ToolCallReq, x_tenant_key: str | None = Header(default=
 
 
 class ToolOptionsReq(BaseModel):
-    name: str                       # 工具名(= skill_id 点转 __)
-    field: str                      # 要列可选项的业务参数名
+    name: str = Field(min_length=1, max_length=300)   # 工具名(= skill_id 点转 __)
+    field: str = Field(min_length=1, max_length=200)  # 要列可选项的业务参数名
     query: str = Field(default="", max_length=200)
     context: dict = Field(default_factory=dict)   # 已填写的业务字段,用于级联候选
     limit: int = Field(default=50, ge=1, le=100)
@@ -1032,9 +1032,13 @@ async def tool_options(req: ToolOptionsReq, x_tenant_key: str | None = Header(de
     sub_str, _, action = skill_id.partition(".")
     if not action:
         raise HTTPException(status_code=400, detail="name 应能解析为 {subsystem}.{action}")
+    try:
+        subsystem = Subsystem(sub_str)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"未知 subsystem: {sub_str}") from exc
     orch = await _orchestrator(tenant)
     return await orch.list_field_options(
-        Subsystem(sub_str), action, req.field, tenant=tenant,
+        subsystem, action, req.field, tenant=tenant,
         query=req.query, context=req.context, limit=req.limit, cursor=req.cursor)
 
 

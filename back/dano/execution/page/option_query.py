@@ -17,6 +17,10 @@ from typing import Any
 OPTION_QUERY_VERSION = "option-query/v1"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
+MAX_CONTEXT_FIELDS = 64
+MAX_CONTEXT_BYTES = 16 * 1024
+MAX_OFFSET = 10_000
+MAX_SOURCE_PAGES = 4
 
 
 def _requests(api_request: dict) -> list[dict]:
@@ -49,11 +53,48 @@ def _binding_value(binding: dict, *, query: str, context: dict, limit: int, offs
         return limit
     if source == "offset":
         return offset
+    if source == "const":
+        return binding.get("value", binding.get("default"))
     if source.startswith("context."):
         return _context_get(context, source[len("context."):])
-    if source == "context":
-        return context
-    return binding.get("default")
+    return None
+
+
+def _coerce_binding_value(value, declared: str | None):
+    kind = str(declared or "raw").lower()
+    if kind in {"", "raw", "any"}:
+        return value, None
+    try:
+        if kind == "string":
+            return str(value), None
+        if kind == "integer":
+            if isinstance(value, bool):
+                raise ValueError("boolean is not integer")
+            return int(value), None
+        if kind == "number":
+            if isinstance(value, bool):
+                raise ValueError("boolean is not number")
+            return float(value), None
+        if kind == "boolean":
+            if isinstance(value, bool):
+                return value, None
+            normalized = str(value).strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True, None
+            if normalized in {"0", "false", "no", "off"}:
+                return False, None
+            raise ValueError("not a boolean")
+        if kind == "array":
+            if isinstance(value, (list, tuple, set)):
+                return list(value), None
+            raise ValueError("not an array")
+        if kind == "object":
+            if isinstance(value, dict):
+                return value, None
+            raise ValueError("not an object")
+        return None, f"不支持的绑定类型：{kind}"
+    except (TypeError, ValueError):
+        return None, f"无法把绑定值转换为 {kind}"
 
 
 def _tokens(binding: dict) -> list[str | int]:
@@ -63,20 +104,21 @@ def _tokens(binding: dict) -> list[str | int]:
     path = str(binding.get("path") or "")
     if not path:
         return []
-    # P1-generated bindings use tokens.  The string fallback is intentionally simple
-    # and exists only for hand-authored metadata without special-key names.
     out: list[str | int] = []
-    for segment in path.split("."):
-        if not segment:
-            continue
-        if "[" not in segment:
-            out.append(segment)
-            continue
-        head, *indices = segment.split("[")
-        if head:
-            out.append(head)
-        for index in indices:
-            out.append(int(index.rstrip("]")))
+    try:
+        for segment in path.split("."):
+            if not segment:
+                continue
+            if "[" not in segment:
+                out.append(segment)
+                continue
+            head, *indices = segment.split("[")
+            if head:
+                out.append(head)
+            for index in indices:
+                out.append(int(index.rstrip("]")))
+    except (TypeError, ValueError):
+        return []
     return out
 
 
@@ -130,30 +172,34 @@ def _body_object(select: dict):
 
 
 def _apply_source_bindings(select: dict, *, query: str, context: dict,
-                           limit: int, offset: int) -> tuple[dict, list[str], bool, bool]:
-    """Apply typed source bindings without exposing them to the caller.
-
-    Supported sources are ``query``, ``limit``, ``offset`` and
-    ``context.<business-field>``.  Targets are a query parameter or a JSON/form body
-    token path.  Missing required context is reported before any target request runs.
-    """
+                           limit: int, offset: int) -> tuple[dict, list[str], bool, bool, list[str]]:
+    """Apply typed, allow-listed bindings without exposing the target request."""
     bound = copy.deepcopy(select)
     bindings = list(bound.get("source_input_bindings") or [])
     missing: list[str] = []
+    errors: list[str] = []
     used_query = False
     used_pagination = False
     body, body_kind = _body_object(bound)
     query_params = copy.deepcopy(bound.get("source_query") or {})
 
-    for binding in bindings:
+    for index, binding in enumerate(bindings):
         if not isinstance(binding, dict):
+            errors.append(f"绑定 {index + 1} 不是对象")
             continue
         source = str(binding.get("from") or "")
+        if source not in {"query", "limit", "offset", "const"} and not source.startswith("context."):
+            errors.append(f"绑定 {index + 1} 的来源不受支持")
+            continue
         value = _binding_value(binding, query=query, context=context, limit=limit, offset=offset)
         if source.startswith("context.") and value in (None, "") and binding.get("required", True):
             missing.append(source[len("context."):])
             continue
         if value is None:
+            continue
+        value, conversion_error = _coerce_binding_value(value, binding.get("value_type"))
+        if conversion_error:
+            errors.append(f"绑定 {index + 1}：{conversion_error}")
             continue
         if source == "query":
             used_query = True
@@ -161,10 +207,17 @@ def _apply_source_bindings(select: dict, *, query: str, context: dict,
             used_pagination = True
         target = str(binding.get("target") or "query")
         tokens = _tokens(binding)
+        if not tokens:
+            errors.append(f"绑定 {index + 1} 缺少有效目标路径")
+            continue
         if target == "query":
-            _set_tokens(query_params, tokens, value)
-        elif target == "body" and body is not None and body_kind != "raw":
-            _set_tokens(body, tokens, value)
+            if not _set_tokens(query_params, tokens, value):
+                errors.append(f"绑定 {index + 1} 无法写入查询参数")
+        elif target == "body":
+            if body is None or body_kind == "raw" or not _set_tokens(body, tokens, value):
+                errors.append(f"绑定 {index + 1} 无法写入请求体")
+        else:
+            errors.append(f"绑定 {index + 1} 的目标不受支持")
 
     if query_params:
         bound["source_query"] = query_params
@@ -173,7 +226,8 @@ def _apply_source_bindings(select: dict, *, query: str, context: dict,
             bound["source_post_data"] = urlencode(body, doseq=True)
         else:
             bound["source_post_data"] = body
-    return bound, list(dict.fromkeys(missing)), used_query, used_pagination
+    return (bound, list(dict.fromkeys(missing)), used_query, used_pagination,
+            list(dict.fromkeys(errors)))
 
 
 def _normalize_option(item, *, label_key: str | None, value_key: str | None) -> dict | None:
@@ -239,7 +293,7 @@ def _decode_cursor(cursor: str | None, fingerprint: str) -> tuple[int, bool]:
         padded = str(cursor) + "=" * (-len(str(cursor)) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
         offset = int(payload.get("o", 0))
-        return (offset, offset >= 0 and payload.get("f") == fingerprint)
+        return (offset, 0 <= offset <= MAX_OFFSET and payload.get("f") == fingerprint)
     except Exception:  # noqa: BLE001
         return 0, False
 
@@ -248,12 +302,13 @@ def _response(field: str, *, status: str, options: list[dict] | None = None,
               total: int = 0, returned: int | None = None, submit_mode: str = "value",
               has_more: bool = False, next_cursor: str | None = None,
               note: str | None = None, http_status: int | None = None,
-              dependencies: list[str] | None = None) -> dict:
+              dependencies: list[str] | None = None, count_exact: bool = True) -> dict:
     out = {
         "protocol_version": OPTION_QUERY_VERSION,
         "field": field,
         "options": list(options or []),
         "count": total,
+        "count_exact": count_exact,
         "returned": len(options or []) if returned is None else returned,
         "submit_mode": submit_mode,
         "source_status": status,
@@ -273,10 +328,17 @@ async def query_field_options(api_request: dict, field: str, *, base_url: str = 
                               storage_state=None, token_key: str | None = None,
                               verify: bool = True, query: str = "", context: dict | None = None,
                               limit: int = DEFAULT_LIMIT, cursor: str | None = None) -> dict:
-    """Return one public page of options while keeping the target source private."""
+    """Return one public option page while keeping target-system details private."""
     from dano.execution.page import option_p0
 
     context = dict(context or {})
+    try:
+        context_bytes = len(json.dumps(context, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return _response(field, status="invalid_context", note="业务上下文无法序列化")
+    if len(context) > MAX_CONTEXT_FIELDS or context_bytes > MAX_CONTEXT_BYTES:
+        return _response(field, status="invalid_context", note="业务上下文过大，请只提交候选依赖字段")
+
     limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
     fingerprint = _fingerprint(query, context)
     offset, cursor_ok = _decode_cursor(cursor, fingerprint)
@@ -287,65 +349,110 @@ async def query_field_options(api_request: dict, field: str, *, base_url: str = 
     if not select:
         return _response(field, status="not_dynamic", note="该字段不是选择字段")
     submit_mode = select.get("submit_mode") or ("value[]" if select.get("kind") == "array" else "value")
-
-    bound, missing, used_upstream_query, used_upstream_pagination = _apply_source_bindings(
-        select, query=query, context=context, limit=limit, offset=offset)
     dependencies = sorted({
         str(binding.get("from"))[len("context."):]
         for binding in (select.get("source_input_bindings") or [])
         if isinstance(binding, dict) and str(binding.get("from") or "").startswith("context.")
     })
-    if missing:
-        return _response(
-            field, status="needs_context", submit_mode=submit_mode, dependencies=missing,
-            note="请先填写依赖字段：" + "、".join(missing))
+    request_headers = {
+        **dict((api_request or {}).get("auth_headers") or {}),
+        **dict((request or {}).get("auth_headers") or {}),
+    }
 
-    if bound.get("source_url"):
-        request_headers = {
-            **dict((api_request or {}).get("auth_headers") or {}),
-            **dict((request or {}).get("auth_headers") or {}),
-        }
-        items, source = await option_p0._fetch_options(
-            bound,
-            base_url=base_url,
-            storage_state=storage_state,
-            token_key=token_key,
-            verify=verify,
-            auth_headers=request_headers,
-        )
-        if not source.get("ok"):
-            return _response(
-                field, status=str(source.get("source_status") or "source_error"),
-                submit_mode=submit_mode, note=str(source.get("message") or "候选来源不可用"),
-                http_status=int(source.get("status") or 0), dependencies=dependencies)
-    else:
-        items = list(bound.get("options") or [])
+    async def fetch_page(page_offset: int):
+        bound, missing, used_query, used_pagination, binding_errors = _apply_source_bindings(
+            select, query=query, context=context, limit=limit, offset=page_offset)
+        if missing:
+            return None, _response(
+                field, status="needs_context", submit_mode=submit_mode, dependencies=missing,
+                note="请先填写依赖字段：" + "、".join(missing))
+        if binding_errors:
+            return None, _response(
+                field, status="invalid_binding", submit_mode=submit_mode, dependencies=dependencies,
+                note="；".join(binding_errors))
+        if bound.get("source_url"):
+            items, source = await option_p0._fetch_options(
+                bound, base_url=base_url, storage_state=storage_state,
+                token_key=token_key, verify=verify, auth_headers=request_headers)
+            if not source.get("ok"):
+                return None, _response(
+                    field, status=str(source.get("source_status") or "source_error"),
+                    submit_mode=submit_mode, note=str(source.get("message") or "候选来源不可用"),
+                    http_status=int(source.get("status") or 0), dependencies=dependencies)
+            raw_count = int(source.get("raw_count", len(items)))
+        else:
+            items = list(bound.get("options") or [])
+            raw_count = len(items)
+        return {
+            "bound": bound,
+            "items": items,
+            "raw_count": max(raw_count, 0),
+            "used_query": used_query,
+            "used_pagination": used_pagination,
+        }, None
 
-    options = _normalize_options(items, bound)
-    # Even when the target source supports a query binding, local filtering prevents a
-    # permissive/ignored upstream query from leaking unrelated rows into the UI.
-    filtered = _filter_options(options, query)
-    if used_upstream_pagination:
-        # The target source already consumed offset/limit. Do not apply the same offset
-        # twice. A full page means another page may exist; execution still revalidates
-        # the final submitted value against the live source.
-        page = filtered[:limit]
-        next_offset = offset + len(page)
-        has_more = len(page) >= limit
-        total = next_offset + (1 if has_more else 0)
-    else:
+    first, error = await fetch_page(offset)
+    if error:
+        return error
+    assert first is not None
+
+    if not first["used_pagination"]:
+        options = _normalize_options(first["items"], first["bound"])
+        filtered = _filter_options(options, query)
         total = len(filtered)
         page = filtered[offset:offset + limit]
         next_offset = offset + len(page)
-        has_more = next_offset < total
-    next_cursor = _encode_cursor(next_offset, fingerprint) if has_more else None
-    status = "ok" if page else "empty"
+        has_more = next_offset < total and next_offset <= MAX_OFFSET
+        note = "已在 Dano 内部筛选候选项" if query and not first["used_query"] else None
+        if not page:
+            note = "当前条件下没有可选项"
+        return _response(
+            field, status="ok" if page else "empty", options=page, total=total,
+            submit_mode=submit_mode, has_more=has_more,
+            next_cursor=_encode_cursor(next_offset, fingerprint) if has_more else None,
+            note=note, dependencies=dependencies, count_exact=True)
+
+    collected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    consumed = 0
+    last_raw_count = 0
+    used_query = bool(first["used_query"])
+    current = first
+    attempts = 0
+    while attempts < MAX_SOURCE_PAGES:
+        attempts += 1
+        normalized = _normalize_options(current["items"], current["bound"])
+        for option in _filter_options(normalized, query):
+            key = (str(option.get("label") or ""), str(option.get("value") or ""))
+            if key not in seen:
+                seen.add(key)
+                collected.append(option)
+        last_raw_count = int(current["raw_count"])
+        consumed += last_raw_count
+        if len(collected) >= limit or last_raw_count < limit or last_raw_count == 0:
+            break
+        next_page_offset = offset + consumed
+        if next_page_offset > MAX_OFFSET:
+            break
+        current, error = await fetch_page(next_page_offset)
+        if error:
+            return error
+        assert current is not None
+        used_query = used_query or bool(current["used_query"])
+
+    page = collected[:limit]
+    next_offset = offset + consumed
+    has_more = last_raw_count >= limit and next_offset <= MAX_OFFSET
     note = None
-    if status == "empty":
+    if not page:
         note = "当前条件下没有可选项"
-    elif query and not used_upstream_query:
+    elif query and not used_query:
         note = "已在 Dano 内部筛选候选项"
+    if next_offset > MAX_OFFSET:
+        has_more = False
+        note = "已达到候选浏览上限，请使用更精确的搜索词"
     return _response(
-        field, status=status, options=page, total=total, submit_mode=submit_mode,
-        has_more=has_more, next_cursor=next_cursor, note=note,
-        dependencies=dependencies)
+        field, status="ok" if page else "empty", options=page,
+        total=next_offset + (1 if has_more else 0), submit_mode=submit_mode,
+        has_more=has_more, next_cursor=_encode_cursor(next_offset, fingerprint) if has_more else None,
+        note=note, dependencies=dependencies, count_exact=not has_more)

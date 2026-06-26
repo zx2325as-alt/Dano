@@ -71,6 +71,8 @@ export type OptionSourceStatus =
   | "invalid_shape"
   | "invalid_cursor"
   | "needs_context"
+  | "invalid_context"
+  | "invalid_binding"
   | "invalid_request"
   | "unsupported_method"
   | "source_conflict"
@@ -79,6 +81,7 @@ export type OptionSourceStatus =
 export interface ToolOptionsResponse {
   field: string;
   count: number;
+  count_exact?: boolean;
   options: ToolOption[];
   submit_mode?: string;
   source_status?: OptionSourceStatus | string;
