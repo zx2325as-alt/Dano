@@ -4,13 +4,13 @@ Recorded option requests are untrusted asset data. Before the runtime sends one,
 module enforces the narrow read contract expected from an option source:
 
 * only GET and POST are accepted;
-* only HTTP(S) URLs are accepted;
+* only HTTP(S) absolute URLs are accepted;
 * credentials embedded in a URL are rejected;
 * when a target-system base URL is known, the option source must be same-origin.
 
-This prevents a malformed or tampered Skill from turning candidate lookup into an
-arbitrary authenticated request or leaking the current runtime credential to another
-host.
+Relative URLs remain compatible when the legacy caller has not supplied ``base_url``;
+they cannot redirect credentials to another origin by themselves and the underlying
+runtime preserves its previous resolution/error behavior.
 """
 from __future__ import annotations
 
@@ -68,12 +68,9 @@ def _validate_source_request(select: dict, base_url: str) -> dict | None:
 
     base = str(base_url or "").strip()
     if not parsed_raw.scheme and not base:
-        return {
-            "ok": False,
-            "status": 0,
-            "source_status": "missing_base_url",
-            "message": "相对候选来源缺少目标系统 base_url",
-        }
+        # Legacy execute paths may resolve this later from their own request context.
+        # A relative URL is not cross-origin by itself, so do not reject it here.
+        return None
 
     full_url = raw_url if parsed_raw.scheme else urljoin(base.rstrip("/") + "/", raw_url.lstrip("/"))
     source_origin = _origin(full_url)
