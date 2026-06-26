@@ -541,37 +541,48 @@ class Orchestrator:
         )
 
     async def list_field_options(self, subsystem: Subsystem, action: str, field: str,
-                                 *, tenant: str = "") -> dict:
-        """**实时**列出某选择型字段的当前可选项 —— 直接调它的来源接口,带运行期登录态(与 invoke 同一套配置)。
-        问题1:把接口放进 skill。选字段前先拉真实选项,agent 从中选,不凭空猜、不靠过时快照。失败 → options=[]。"""
+                                 *, tenant: str = "", query: str = "", context: dict | None = None,
+                                 limit: int = 50, cursor: str | None = None) -> dict:
+        """Query one public page of live options through Dano's private source broker."""
         import json as _json
 
-        from dano.execution.page.request_capture import fetch_field_options
+        from dano.execution.page.option_query import query_field_options
         from dano.execution.page.sessions import session_path_if_exists
         from dano.infra.http import tls_verify
         from dano.infra.token_store import get_token_headers, merge_auth_headers
+
         skill = self.registry.by_action(subsystem, action)
         if skill is None or not getattr(skill, "page_asset_id", None):
-            return {"field": field, "options": [], "count": 0, "note": "未知动作 / 非页面型 skill"}
+            return {"protocol_version": "option-query/v1", "field": field, "options": [],
+                    "count": 0, "returned": 0, "source_status": "not_dynamic",
+                    "has_more": False, "next_cursor": None,
+                    "note": "未知动作或非页面型 Skill"}
         env = await self.store.get(skill.page_asset_id)
-        apir = (env.body or {}).get("api_request") if env else None
-        if not apir:
-            return {"field": field, "options": [], "count": 0, "note": "该 skill 无接口请求"}
+        api_request = (env.body or {}).get("api_request") if env else None
+        if not api_request:
+            return {"protocol_version": "option-query/v1", "field": field, "options": [],
+                    "count": 0, "returned": 0, "source_status": "not_dynamic",
+                    "has_more": False, "next_cursor": None,
+                    "note": "该 Skill 没有可查询的请求来源"}
+
         scope = Scope(tenant=tenant, subsystem=skill.subsystem)
-        ep = await self.store.get_published(AssetType.ENV_PROFILE, scope, asset_key="env_profile")
-        base_url = ((ep.body.get("base_url") if ep else "") or "")
+        profile = await self.store.get_published(AssetType.ENV_PROFILE, scope, asset_key="env_profile")
+        base_url = ((profile.body.get("base_url") if profile else "") or "")
         storage = None
-        sp = session_path_if_exists(tenant, skill.subsystem.value)
-        if sp:
+        session_path = session_path_if_exists(tenant, skill.subsystem.value)
+        if session_path:
             try:
-                storage = _json.loads(open(sp, encoding="utf-8").read())
+                storage = _json.loads(open(session_path, encoding="utf-8").read())
             except Exception:  # noqa: BLE001
                 pass
-        override = await get_token_headers(tenant, skill.subsystem.value)   # 运行期最新鉴权头(治焊死旧 token 过期)
-        if override:
-            apir = merge_auth_headers(apir, override)
-        return await fetch_field_options(apir, field, base_url=base_url, storage_state=storage,
-                                         verify=tls_verify())
+
+        runtime_headers = await get_token_headers(tenant, skill.subsystem.value)
+        if runtime_headers:
+            api_request = merge_auth_headers(api_request, runtime_headers)
+        return await query_field_options(
+            api_request, field, base_url=base_url, storage_state=storage,
+            verify=tls_verify(), query=query, context=context or {},
+            limit=limit, cursor=cursor)
 
     async def _run_page(self, task_id, skill, intent, *, confirm, tenant="") -> TaskOutcome:  # noqa: ANN001
         """无 API 页面辅助执行(流程8)。有 api_request(抓请求路径)则直接发请求,不开浏览器。"""

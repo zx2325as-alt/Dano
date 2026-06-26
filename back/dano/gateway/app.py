@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dano.assets.repository import AssetRepository
 from dano.catalog.manifest import build_function_tools, build_manifests, skill_id_of
@@ -1012,21 +1012,34 @@ async def call_tool(req: ToolCallReq, x_tenant_key: str | None = Header(default=
 
 
 class ToolOptionsReq(BaseModel):
-    name: str                       # 工具名(= skill_id 点转 __)
-    field: str                      # 要列可选项的**参数名**(选择型字段)
+    name: str = Field(min_length=1, max_length=300)   # 工具名(= skill_id 点转 __)
+    field: str = Field(min_length=1, max_length=200)  # 要列可选项的业务参数名
+    query: str = Field(default="", max_length=200)
+    context: dict = Field(default_factory=dict)   # 已填写的业务字段,用于级联候选
+    limit: int = Field(default=50, ge=1, le=100)
+    cursor: str | None = Field(default=None, max_length=512)
 
 
 @app.post("/v1/tools/options")
 async def tool_options(req: ToolOptionsReq, x_tenant_key: str | None = Header(default=None)) -> dict:
-    """**实时**列出某选择型字段的当前可选项(问题1:把接口放进 skill,选字段时直接调来源接口拉真实选项)。
-    skill 不持目标系统凭证 → 经 Dano 用运行期登录态调来源接口,返回 {field, options:[{label,value}], count}。"""
+    """受控候选查询入口。
+
+    前端只提交 Skill、字段、搜索词和业务上下文。目标系统 URL、请求体、响应路径与凭证
+    始终留在 Dano 后端；返回统一的 option-query/v1 label/value 分页结果。
+    """
     tenant = await _auth_tenant(x_tenant_key)
     skill_id = skill_id_of(req.name)
     sub_str, _, action = skill_id.partition(".")
     if not action:
         raise HTTPException(status_code=400, detail="name 应能解析为 {subsystem}.{action}")
+    try:
+        subsystem = Subsystem(sub_str)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"未知 subsystem: {sub_str}") from exc
     orch = await _orchestrator(tenant)
-    return await orch.list_field_options(Subsystem(sub_str), action, req.field, tenant=tenant)
+    return await orch.list_field_options(
+        subsystem, action, req.field, tenant=tenant,
+        query=req.query, context=req.context, limit=req.limit, cursor=req.cursor)
 
 
 class ExportSkillsReq(BaseModel):

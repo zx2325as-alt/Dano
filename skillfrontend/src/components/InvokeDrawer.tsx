@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Drawer, Button, Checkbox, Input, InputNumber, DatePicker, Radio, Select, Typography, Tag,
   Alert, Descriptions, Space, message, Image,
@@ -13,7 +13,7 @@ const STATE_COLOR: Record<string, string> = {
 };
 
 const OPTION_READY = new Set(["ok", "empty"]);
-const OPTION_NON_ERROR = new Set(["idle", "loading", "ok", "empty"]);
+const OPTION_NON_ERROR = new Set(["idle", "loading", "ok", "empty", "needs_context"]);
 
 type OptionLoadState = {
   status: string;
@@ -76,6 +76,11 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
   const [optionCache, setOptionCache] = useState<Record<string, ToolOption[]>>({});
   const [optionLoading, setOptionLoading] = useState<Record<string, boolean>>({});
   const [optionState, setOptionState] = useState<Record<string, OptionLoadState>>({});
+  const [optionCursor, setOptionCursor] = useState<Record<string, string | null>>({});
+  const [optionHasMore, setOptionHasMore] = useState<Record<string, boolean>>({});
+  const [optionQuery, setOptionQuery] = useState<Record<string, string>>({});
+  const optionTimers = useRef<Record<string, number>>({});
+  const optionRequestSeq = useRef<Record<string, number>>({});
 
   const props = useMemo(() => skill?.parameters?.properties || {}, [skill]);
   const required = useMemo(() => new Set(skill?.parameters?.required || []), [skill]);
@@ -90,60 +95,141 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
       setOptionCache({});
       setOptionLoading({});
       setOptionState({});
+      setOptionCursor({});
+      setOptionHasMore({});
+      setOptionQuery({});
+      Object.values(optionTimers.current).forEach((timer) => window.clearTimeout(timer));
+      optionTimers.current = {};
+      optionRequestSeq.current = {};
     }
   }, [skill]);
 
-  const setVal = (k: string, v: unknown) => setValues((p) => ({ ...p, [k]: v }));
+  const clearOptionFields = (fields: string[], clearValues = true) => {
+    if (!fields.length) return;
+    const targets = new Set(fields);
+    setOptionCache((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => !targets.has(key))));
+    setOptionState((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => !targets.has(key))));
+    setOptionCursor((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => !targets.has(key))));
+    setOptionHasMore((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => !targets.has(key))));
+    setOptionQuery((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => !targets.has(key))));
+    if (clearValues) {
+      setValues((prev) => ({ ...prev, ...Object.fromEntries(fields.map((field) => [field, undefined])) }));
+    }
+  };
 
-  async function loadOptions(key: string, p: JSONSchemaProperty, force = false) {
-    if (!skill || optionLoading[key]) return;
+  const dependentOptionFields = (changed: string): string[] => {
+    const result = new Set<string>();
+    const queue = [changed];
+    while (queue.length) {
+      const current = queue.shift() as string;
+      for (const [field, prop] of Object.entries(props)) {
+        if (field === changed || result.has(field)) continue;
+        if ((prop?.["x-option-depends-on"] || []).includes(current)) {
+          result.add(field);
+          queue.push(field);
+        }
+      }
+    }
+    return [...result];
+  };
+
+  const setVal = (key: string, value: unknown) => {
+    setValues((prev) => ({ ...prev, [key]: value }));
+    clearOptionFields(dependentOptionFields(key));
+  };
+
+  const mergeOptions = (current: ToolOption[], incoming: ToolOption[]): ToolOption[] => {
+    const seen = new Set<string>();
+    return [...current, ...incoming].filter((option) => {
+      const key = `${option.label}\u0000${String(option.value)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+
+  async function loadOptions(
+    key: string,
+    p: JSONSchemaProperty,
+    args: { force?: boolean; query?: string; append?: boolean } = {},
+  ) {
+    if (!skill) return;
+    if (optionLoading[key] && !args.force) return;
     const dynamic = !!p?.["x-options-source"];
     if (!dynamic) {
       if (!(key in optionCache)) setOptionCache((prev) => ({ ...prev, [key]: normalizeOptions(p) }));
       return;
     }
-    if (!force && OPTION_READY.has(optionState[key]?.status || "")) return;
+    const query = args.query ?? optionQuery[key] ?? "";
+    const append = !!args.append;
+    const sameQuery = query === (optionQuery[key] ?? "");
+    if (!args.force && !append && sameQuery && OPTION_READY.has(optionState[key]?.status || "")) return;
 
+    const seq = (optionRequestSeq.current[key] || 0) + 1;
+    optionRequestSeq.current[key] = seq;
     setOptionLoading((prev) => ({ ...prev, [key]: true }));
     setOptionState((prev) => ({ ...prev, [key]: { status: "loading" } }));
     try {
-      const res = await listSkillOptions(skill.name, key);
-      const status = res.source_status || ((res.options || []).length ? "ok" : "empty");
+      const context = Object.fromEntries(Object.entries(values).filter(([field, value]) => field !== key && value != null && value !== ""));
+      const response = await listSkillOptions(skill.name, key, {
+        query,
+        context,
+        limit: p?.["x-options-page-size"] || 50,
+        cursor: append ? optionCursor[key] : null,
+      });
+      if (optionRequestSeq.current[key] !== seq) return;
+      const status = response.source_status || ((response.options || []).length ? "ok" : "empty");
       if (OPTION_READY.has(status)) {
-        setOptionCache((prev) => ({ ...prev, [key]: res.options || [] }));
-        setOptionState((prev) => ({
+        setOptionCache((prev) => ({
           ...prev,
-          [key]: { status, message: res.note, httpStatus: res.http_status },
+          [key]: append ? mergeOptions(prev[key] || [], response.options || []) : (response.options || []),
         }));
-        if (status === "empty" && res.note) message.info(res.note);
-      } else {
-        // 动态来源失败时不使用录制快照，也不保留之前选中的旧值。
-        setOptionCache((prev) => {
-          const next = { ...prev };
-          delete next[key];
-          return next;
-        });
-        setVal(key, undefined);
-        const detail = res.note || `候选来源不可用（${status}）`;
+        setOptionCursor((prev) => ({ ...prev, [key]: response.next_cursor || null }));
+        setOptionHasMore((prev) => ({ ...prev, [key]: !!response.has_more }));
+        setOptionQuery((prev) => ({ ...prev, [key]: query }));
         setOptionState((prev) => ({
           ...prev,
-          [key]: { status, message: detail, httpStatus: res.http_status },
+          [key]: { status, message: response.note, httpStatus: response.http_status },
+        }));
+      } else if (status === "needs_context") {
+        clearOptionFields([key]);
+        setOptionState((prev) => ({
+          ...prev,
+          [key]: { status, message: response.note || "请先填写依赖字段", httpStatus: response.http_status },
+        }));
+      } else {
+        clearOptionFields([key]);
+        const detail = response.note || `候选来源不可用（${status}）`;
+        setOptionState((prev) => ({
+          ...prev,
+          [key]: { status, message: detail, httpStatus: response.http_status },
         }));
         message.error(`${key}：${detail}`);
       }
-    } catch (e: any) {
-      setOptionCache((prev) => {
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      });
-      setVal(key, undefined);
-      const detail = e?.response?.data?.detail || e.message || "候选来源请求失败";
+    } catch (error: any) {
+      if (optionRequestSeq.current[key] !== seq) return;
+      clearOptionFields([key]);
+      const detail = error?.response?.data?.detail || error.message || "候选来源请求失败";
       setOptionState((prev) => ({ ...prev, [key]: { status: "network_error", message: detail } }));
       message.error(`拉取 ${key} 候选失败：${detail}`);
     } finally {
-      setOptionLoading((prev) => ({ ...prev, [key]: false }));
+      if (optionRequestSeq.current[key] === seq) {
+        setOptionLoading((prev) => ({ ...prev, [key]: false }));
+      }
     }
+  }
+
+  function scheduleOptionSearch(key: string, p: JSONSchemaProperty, query: string) {
+    if (optionTimers.current[key]) window.clearTimeout(optionTimers.current[key]);
+    setOptionQuery((prev) => ({ ...prev, [key]: query }));
+    optionTimers.current[key] = window.setTimeout(() => {
+      void loadOptions(key, p, { force: true, query });
+    }, 300);
+  }
+
+  function loadMoreOptions(key: string, p: JSONSchemaProperty) {
+    if (!optionHasMore[key] || !optionCursor[key] || optionLoading[key]) return;
+    void loadOptions(key, p, { append: true, query: optionQuery[key] || "" });
   }
 
   async function doInvoke(input: Record<string, unknown>) {
@@ -192,7 +278,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
   }
 
   const fieldRow = (key: string, p: JSONSchemaProperty) => {
-    const label = p.description || key;
+    const label = p.label || p.description || key;
     const hint = `${key} ${label}`;
     const reqMark = required.has(key) ? <span style={{ color: "#cf1322" }}> *</span> : null;
     let widget;
@@ -209,20 +295,27 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           showSearch
           allowClear
           optionFilterProp="label"
+          filterOption={dynamic ? false : undefined}
           style={{ width: "100%" }}
           value={(values[key] as any) ?? undefined}
           options={options}
           loading={!!optionLoading[key]}
           status={sourceFailed ? "error" : undefined}
-          placeholder={dynamic ? `打开下拉实时加载${label}` : key}
+          placeholder={dynamic ? `输入关键词搜索${label}` : key}
           notFoundContent={
             optionLoading[key] ? "正在加载候选…"
-              : sourceFailed ? "候选来源不可用"
-                : state?.status === "empty" ? "当前条件下没有可选项"
-                  : dynamic ? "打开下拉加载实时候选" : "无可选项"
+              : state?.status === "needs_context" ? (state.message || "请先填写依赖字段")
+                : sourceFailed ? "候选来源不可用"
+                  : state?.status === "empty" ? "当前条件下没有可选项"
+                    : dynamic ? "输入关键词搜索或打开下拉加载" : "无可选项"
           }
           onFocus={() => loadOptions(key, p)}
           onDropdownVisibleChange={(open) => { if (open) loadOptions(key, p); }}
+          onSearch={dynamic ? (query) => scheduleOptionSearch(key, p, query) : undefined}
+          onPopupScroll={dynamic ? (event) => {
+            const target = event.currentTarget as HTMLDivElement;
+            if (target.scrollTop + target.clientHeight >= target.scrollHeight - 24) loadMoreOptions(key, p);
+          } : undefined}
           onChange={(v) => setVal(key, v)}
         />
       );
@@ -234,15 +327,29 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
             showIcon
             message={state?.message || "动态候选来源不可用"}
             description={state?.httpStatus ? `HTTP ${state.httpStatus}` : undefined}
-            action={<Button size="small" onClick={() => loadOptions(key, p, true)}>重试</Button>}
+            action={<Button size="small" onClick={() => loadOptions(key, p, { force: true })}>重试</Button>}
           />
+        );
+      } else if (dynamic && state?.status === "needs_context") {
+        sourceHint = (
+          <Alert style={{ marginTop: 6 }} type="info" showIcon message={state.message || "请先填写依赖字段"} />
         );
       } else if (dynamic && state?.status === "empty") {
         sourceHint = (
           <Space size={4} style={{ marginTop: 4 }}>
             <Typography.Text type="secondary">{state.message || "当前条件下没有可选项"}</Typography.Text>
-            <Button type="link" size="small" onClick={() => loadOptions(key, p, true)}>重新加载</Button>
+            {optionHasMore[key] ? (
+              <Button type="link" size="small" loading={!!optionLoading[key]}
+                      onClick={() => loadMoreOptions(key, p)}>继续查找</Button>
+            ) : (
+              <Button type="link" size="small" onClick={() => loadOptions(key, p, { force: true })}>重新加载</Button>
+            )}
           </Space>
+        );
+      } else if (dynamic && optionHasMore[key]) {
+        sourceHint = (
+          <Button type="link" size="small" loading={!!optionLoading[key]}
+                  onClick={() => loadMoreOptions(key, p)}>加载更多候选</Button>
         );
       }
     } else if (isDate(hint)) {

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from pydantic import BaseModel, Field
 
 from dano.orchestrator.types import SkillSpec
@@ -92,62 +94,65 @@ def _option_snapshots(raw: list | None) -> list[dict]:
     return opts
 
 
-def _schema_prop(skill: SkillSpec, field: str, desc: str, sel: dict | None = None) -> dict:
-    """字段 → JSON Schema 属性。**type 保持合法**(function-calling 可直接用),但**语义不丢**:
+def _option_dependencies(sel: dict | None) -> list[str]:
+    return sorted({
+        str(binding.get("from"))[len("context."):]
+        for binding in ((sel or {}).get("source_input_bindings") or [])
+        if isinstance(binding, dict) and str(binding.get("from") or "").startswith("context.")
+    })
 
-    - `enum`(选领导/字典下拉):type=string + format=name-ref + x-submit-mode=value。
-      前端展示 label,提交稳定 value;旧 label 仅作运行期兼容。
-      **候选选项内置进 schema**(≤50 条直接 `enum`;更多则带 `x-options-source`,运行期 --list-options 现拉)→
-      agent 从真实可选值里选,不再凭空猜名(问题1:稳固、不易错);
-    - `datetime`/`date`:type=string + 标准 format,告诉 agent 这是日期时间字段;
-    - 其余按信源声明 / 数值语义判定。format 为 JSON Schema 扩展位,校验器忽略未知值,安全。
-    """
+
+def _dynamic_option_contract(prop: dict, sel: dict | None) -> None:
+    prop["x-options-source"] = True
+    prop["x-options-protocol"] = "option-query/v1"
+    prop["x-options-search"] = True
+    prop["x-options-page-size"] = 50
+    dependencies = _option_dependencies(sel)
+    if dependencies:
+        prop["x-option-depends-on"] = dependencies
+
+
+def _schema_prop(skill: SkillSpec, field: str, desc: str, sel: dict | None = None) -> dict:
+    """Build the public field contract without exposing or trusting stale dynamic snapshots."""
     declared = (getattr(skill, "field_types", {}) or {}).get(field)
-    # label=字段纯语义(给 SOP/复述用,简洁);description=语义 + 调用约定(给参数表/function-calling 用)。
-    # 约定不写死示例值(『张三』只适合选人,不适合选值如请假类型);示例由前端/样例值提供,不在此臆造。
+    dynamic = bool((sel or {}).get("source_url"))
     if declared == "array" and sel and sel.get("kind") == "array":
-        prop = {"type": "array", "items": {"type": "string"}, "format": "name-ref-list",
-                "label": desc,
-                "description": desc + ("(多选字段:前端展示 label,调用时提交 value 数组;"
-                                       f"选前先 `--list-options {field}` 实时拉可选项;旧 label 输入仅兼容)"),
-                "x-submit-mode": "value[]",
-                "x-option-label": "label",
-                "x-option-value": "value"}
-        opts = _option_snapshots((sel or {}).get("options") or [])
-        cnt = int((sel or {}).get("count") or len(opts))
-        if (sel or {}).get("source_url"):
-            prop["x-options-source"] = True
-        if opts:
-            prop["x-options"] = opts
-            if len(opts) <= _OPTIONS_INLINE_MAX:
-                prop["items"]["enum"] = [o["value"] for o in opts]
-            if cnt > len(opts):
-                prop["x-options-truncated"] = True
+        prop = {
+            "type": "array", "items": {"type": "string"}, "format": "name-ref-list",
+            "label": desc,
+            "description": desc + "(多选字段:展示 label,调用时提交 value 数组)",
+            "x-submit-mode": "value[]", "x-option-label": "label", "x-option-value": "value",
+        }
+        if dynamic:
+            _dynamic_option_contract(prop, sel)
+        else:
+            options = _option_snapshots((sel or {}).get("options") or [])
+            if options:
+                prop["x-options"] = options
+                if len(options) <= _OPTIONS_INLINE_MAX:
+                    prop["items"]["enum"] = [option["value"] for option in options]
         return prop
     if declared == "enum":
-        prop = {"type": "string", "format": "name-ref", "label": desc,
-                "description": desc + ("(选择型字段:前端展示 label,调用时提交 value;"
-                                       f"选前先 `--list-options {field}` 实时拉可选项;旧 label 输入仅兼容)"),
-                "x-submit-mode": "value",
-                "x-option-label": "label",
-                "x-option-value": "value"}
-        opts = _option_snapshots((sel or {}).get("options") or [])
-        cnt = int((sel or {}).get("count") or len(opts))
-        if (sel or {}).get("source_url"):
-            prop["x-options-source"] = True                  # 该字段有来源接口 → 可 --list-options 实时拉
-        if opts:
-            prop["x-options"] = opts                         # 候选 {label,value} 快照(≤500),写进 references/OPTIONS.md 供离线参考
-            if len(opts) <= _OPTIONS_INLINE_MAX:
-                prop["enum"] = [o["value"] for o in opts]     # ≤50 直接约束提交 value,不是显示名
-            if cnt > len(opts):                              # 快照被截断(候选 >500)→ 以实时拉取为准
-                prop["x-options-truncated"] = True
+        prop = {
+            "type": "string", "format": "name-ref", "label": desc,
+            "description": desc + "(选择型字段:展示 label,调用时提交 value)",
+            "x-submit-mode": "value", "x-option-label": "label", "x-option-value": "value",
+        }
+        if dynamic:
+            _dynamic_option_contract(prop, sel)
+        else:
+            options = _option_snapshots((sel or {}).get("options") or [])
+            if options:
+                prop["x-options"] = options
+                if len(options) <= _OPTIONS_INLINE_MAX:
+                    prop["enum"] = [option["value"] for option in options]
         return prop
     if declared == "datetime":
         return {"type": "string", "format": "date-time", "label": desc,
-                "description": desc + "(日期时间;传 `YYYY-MM-DD` 或 `YYYY-MM-DD HH:mm:ss`,Dano 运行期自动转成目标系统格式,**勿自己拼时间戳**)"}
+                "description": desc + "(日期时间;传 `YYYY-MM-DD` 或 `YYYY-MM-DD HH:mm:ss`,由 Dano 转换目标格式)"}
     if declared == "date":
         return {"type": "string", "format": "date", "label": desc,
-                "description": desc + "(日期;传 `YYYY-MM-DD`,Dano 运行期自动转成目标系统格式)"}
+                "description": desc + "(日期;传 `YYYY-MM-DD`,由 Dano 转换目标格式)"}
     if declared in ("number", "integer", "boolean", "array", "object"):
         return {"type": declared, "label": desc, "description": desc}
     return {"type": "number" if is_numeric_field(field, desc, declared_type=declared) else "string",
@@ -176,22 +181,63 @@ def _parameters_schema(skill: SkillSpec) -> dict:
     }
 
 
+def _public_skill_interface(interface: dict) -> dict:
+    """Strip target-system implementation details from the catalog response."""
+    if not interface:
+        return {}
+    raw_sources = dict(interface.get("source_schema") or {})
+    public_sources: dict[str, dict] = {}
+    for source_id, source in raw_sources.items():
+        source = dict(source or {})
+        dynamic = bool(source.get("dynamic") or source.get("has_runtime_source") or source.get("url"))
+        public_sources[str(source_id)] = {
+            "id": str(source.get("id") or source_id),
+            "kind": "dynamic_options" if dynamic else "static_options",
+            "fields": list(source.get("fields") or []),
+            "submit_modes": list(source.get("submit_modes") or []),
+            "dynamic": dynamic,
+            "count_hint": source.get("count_hint", source.get("count")),
+            "protocol": "option-query/v1" if dynamic else "inline",
+            "supports_search": dynamic,
+            "supports_pagination": dynamic,
+        }
+    public_bindings = []
+    for binding in interface.get("bindings") or []:
+        if not isinstance(binding, dict):
+            continue
+        public_bindings.append({
+            key: copy.deepcopy(binding.get(key))
+            for key in ("input", "mode", "source_id", "step")
+            if binding.get(key) is not None
+        })
+    return {
+        "version": "skill-interface/public-v2",
+        "input_schema": copy.deepcopy(interface.get("input_schema") or {}),
+        "source_schema": public_sources,
+        "bindings": public_bindings,
+        "success": {"configured": bool(interface.get("success"))},
+        "provenance": {
+            key: value for key, value in dict(interface.get("provenance") or {}).items()
+            if key in {"transaction_ir_version", "capture_hash", "trace_hash"} and value
+        },
+    }
+
+
 def _skill_interface(skill: SkillSpec) -> dict:
-    """Expose recorded request interface without changing function-call schema."""
-    si = dict(getattr(skill, "skill_interface", {}) or {})
-    if si:
-        return si
-    apir = getattr(skill, "api_request", None) or {}
-    si = dict(apir.get("skill_interface") or {})
-    if si:
-        return si
-    if apir:
-        try:
-            from dano.execution.page.skill_interface import build_skill_interface
-            return build_skill_interface(apir, required_fields=list(getattr(skill, "required_fields", []) or []))
-        except Exception:  # noqa: BLE001
-            return {}
-    return si
+    """Return a public interface; raw endpoint and request metadata stay in assets."""
+    interface = dict(getattr(skill, "skill_interface", {}) or {})
+    if not interface:
+        api_request = getattr(skill, "api_request", None) or {}
+        interface = dict(api_request.get("skill_interface") or {})
+        if not interface and api_request:
+            try:
+                from dano.execution.page.skill_interface import build_skill_interface
+                interface = build_skill_interface(
+                    api_request,
+                    required_fields=list(getattr(skill, "required_fields", []) or []))
+            except Exception:  # noqa: BLE001
+                interface = {}
+    return _public_skill_interface(interface)
 
 
 def _req_path(req: dict) -> str:
