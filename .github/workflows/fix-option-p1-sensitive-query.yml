@@ -1,0 +1,39 @@
+name: Fix Option P1 Sensitive Query
+
+on:
+  push:
+    branches:
+      - "fix/option-capability-p1"
+    paths:
+      - "scripts/fix_option_p1_sensitive_query.py"
+      - ".github/workflows/fix-option-p1-sensitive-query.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/option-capability-p1
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply fix
+        run: python scripts/fix_option_p1_sensitive_query.py
+      - name: Commit fix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add back/dano/execution/page/option_p0.py
+          git commit -m "fix(options): preserve redaction when normalizing query sources"
+          git push origin HEAD:fix/option-capability-p1
