@@ -130,7 +130,7 @@ def _body_object(select: dict):
 
 
 def _apply_source_bindings(select: dict, *, query: str, context: dict,
-                           limit: int, offset: int) -> tuple[dict, list[str], bool]:
+                           limit: int, offset: int) -> tuple[dict, list[str], bool, bool]:
     """Apply typed source bindings without exposing them to the caller.
 
     Supported sources are ``query``, ``limit``, ``offset`` and
@@ -141,6 +141,7 @@ def _apply_source_bindings(select: dict, *, query: str, context: dict,
     bindings = list(bound.get("source_input_bindings") or [])
     missing: list[str] = []
     used_query = False
+    used_pagination = False
     body, body_kind = _body_object(bound)
     query_params = copy.deepcopy(bound.get("source_query") or {})
 
@@ -156,6 +157,8 @@ def _apply_source_bindings(select: dict, *, query: str, context: dict,
             continue
         if source == "query":
             used_query = True
+        if source in {"limit", "offset"}:
+            used_pagination = True
         target = str(binding.get("target") or "query")
         tokens = _tokens(binding)
         if target == "query":
@@ -170,7 +173,7 @@ def _apply_source_bindings(select: dict, *, query: str, context: dict,
             bound["source_post_data"] = urlencode(body, doseq=True)
         else:
             bound["source_post_data"] = body
-    return bound, list(dict.fromkeys(missing)), used_query
+    return bound, list(dict.fromkeys(missing)), used_query, used_pagination
 
 
 def _normalize_option(item, *, label_key: str | None, value_key: str | None) -> dict | None:
@@ -285,7 +288,7 @@ async def query_field_options(api_request: dict, field: str, *, base_url: str = 
         return _response(field, status="not_dynamic", note="该字段不是选择字段")
     submit_mode = select.get("submit_mode") or ("value[]" if select.get("kind") == "array" else "value")
 
-    bound, missing, used_upstream_query = _apply_source_bindings(
+    bound, missing, used_upstream_query, used_upstream_pagination = _apply_source_bindings(
         select, query=query, context=context, limit=limit, offset=offset)
     dependencies = sorted({
         str(binding.get("from"))[len("context."):]
@@ -322,10 +325,19 @@ async def query_field_options(api_request: dict, field: str, *, base_url: str = 
     # Even when the target source supports a query binding, local filtering prevents a
     # permissive/ignored upstream query from leaking unrelated rows into the UI.
     filtered = _filter_options(options, query)
-    total = len(filtered)
-    page = filtered[offset:offset + limit]
-    next_offset = offset + len(page)
-    has_more = next_offset < total
+    if used_upstream_pagination:
+        # The target source already consumed offset/limit. Do not apply the same offset
+        # twice. A full page means another page may exist; execution still revalidates
+        # the final submitted value against the live source.
+        page = filtered[:limit]
+        next_offset = offset + len(page)
+        has_more = len(page) >= limit
+        total = next_offset + (1 if has_more else 0)
+    else:
+        total = len(filtered)
+        page = filtered[offset:offset + limit]
+        next_offset = offset + len(page)
+        has_more = next_offset < total
     next_cursor = _encode_cursor(next_offset, fingerprint) if has_more else None
     status = "ok" if page else "empty"
     note = None
