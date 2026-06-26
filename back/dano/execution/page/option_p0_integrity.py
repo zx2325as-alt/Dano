@@ -29,26 +29,19 @@ def _error(status: dict, code: str, message: str, **extra) -> tuple[list, dict]:
 
 
 def validate_candidate_items(select: dict, items: list, status: dict) -> tuple[list, dict]:
-    """Validate mappings and eliminate only byte-for-byte duplicate candidates.
+    """Reject ambiguous mappings before either display or execution uses them.
 
-    Records with the same label/value but different extra fields are not interchangeable:
-    those extra fields may be expanded into the final write request. They are rejected
-    rather than silently selecting the first record.
+    Exact duplicate records are harmless and remain in the raw list so the public
+    response normalizer can report how many were removed. Records with the same
+    label/value but different extra fields are not interchangeable because those extra
+    fields may be expanded into the final write request.
     """
     if not items:
         return items, status
 
     primitive = all(not isinstance(item, (dict, list)) for item in items)
     if primitive:
-        unique = []
-        seen = set()
-        for item in items:
-            key = _stable(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(item)
-        return unique, {**status, "deduplicated_count": len(items) - len(unique)}
+        return items, status
 
     if not all(isinstance(item, dict) for item in items):
         return _error(
@@ -68,7 +61,6 @@ def validate_candidate_items(select: dict, items: list, status: dict) -> tuple[l
 
     valid: list[dict] = []
     invalid_count = 0
-    exact_seen: set[str] = set()
     pair_to_record: dict[tuple[str, str], str] = {}
     values_to_labels: dict[str, set[str]] = {}
     labels_to_values: dict[str, set[str]] = {}
@@ -94,10 +86,6 @@ def validate_candidate_items(select: dict, items: list, status: dict) -> tuple[l
         pair_to_record[pair] = record_repr
         values_to_labels.setdefault(value_repr, set()).add(label)
         labels_to_values.setdefault(label, set()).add(value_repr)
-
-        if record_repr in exact_seen:
-            continue
-        exact_seen.add(record_repr)
         valid.append(item)
 
     if not valid:
@@ -129,7 +117,6 @@ def validate_candidate_items(select: dict, items: list, status: dict) -> tuple[l
     return valid, {
         **status,
         "invalid_item_count": invalid_count,
-        "deduplicated_count": len(items) - invalid_count - len(valid),
     }
 
 
