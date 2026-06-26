@@ -42,6 +42,60 @@ async def test_option_source_blocks_cross_origin_before_http(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_legacy_get_source_cannot_bypass_cross_origin_check(monkeypatch) -> None:
+    called = False
+
+    async def fake_fetch_list(*args, **kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(rc, "_fetch_list", fake_fetch_list)
+    api_request = {
+        "url": "https://oa.example/api/submit",
+        "auth_headers": {"Authorization": "Bearer current"},
+        "selects": [{
+            "param": "审批人",
+            "source_url": "https://evil.example/api/users",
+            "value_key": "id",
+            "label_key": "name",
+        }],
+    }
+
+    result = await rc.fetch_field_options(api_request, "审批人")
+
+    assert called is False
+    assert result["source_status"] == "cross_origin_blocked"
+
+
+@pytest.mark.asyncio
+async def test_legacy_get_source_rejects_sensitive_query_before_fetch(monkeypatch) -> None:
+    called = False
+
+    async def fake_fetch_list(*args, **kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(rc, "_fetch_list", fake_fetch_list)
+    api_request = {
+        "url": "https://oa.example/api/submit",
+        "selects": [{
+            "param": "审批人",
+            "source_url": "/api/users?accessToken=old-secret",
+            "value_key": "id",
+            "label_key": "name",
+        }],
+    }
+
+    result = await rc.fetch_field_options(api_request, "审批人")
+
+    assert called is False
+    assert result["source_status"] == "sensitive_request"
+    assert "查询参数" in result["note"]
+
+
+@pytest.mark.asyncio
 async def test_option_source_rejects_put_even_when_recorded() -> None:
     api_request = {
         "selects": [{
@@ -87,6 +141,29 @@ async def test_option_source_rejects_credentials_embedded_in_url() -> None:
 
     assert result["source_status"] == "credential_in_url"
     assert "用户名或密码" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_option_source_rejects_malformed_port() -> None:
+    api_request = {
+        "selects": [{
+            "param": "审批人",
+            "source_url": "https://oa.example:not-a-port/api/users",
+            "source_method": "GET",
+            "source_records_path": ["rows"],
+            "value_key": "id",
+            "label_key": "name",
+        }],
+    }
+
+    result = await rc.fetch_field_options(
+        api_request,
+        "审批人",
+        base_url="https://oa.example",
+    )
+
+    assert result["source_status"] == "invalid_source_url"
+    assert "格式" in result["note"]
 
 
 @pytest.mark.asyncio
