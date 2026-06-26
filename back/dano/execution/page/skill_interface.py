@@ -106,29 +106,28 @@ def _select_binding(select: dict) -> dict:
 
 
 def _source_schema(selects: list[dict]) -> dict:
+    """Build the public option-source contract without exposing target-system internals.
+
+    Endpoint URL, HTTP method/body, response paths, auth headers and label/value keys are
+    private runtime metadata. Callers only need an opaque source id and business behavior.
+    """
     sources: dict[str, dict] = {}
     for s in selects:
         sid = _source_id(s)
         src = sources.setdefault(sid, {
             "id": sid,
-            "kind": "http_list",
-            "url": s.get("source_url") or "",
+            "kind": "dynamic_options" if s.get("source_url") else "static_options",
             "fields": [],
             "submit_modes": [],
-            "value_key": s.get("value_key") or "",
-            "label_key": s.get("label_key") or "",
-            "count": s.get("count"),
-            "has_runtime_source": bool(s.get("source_url")),
+            "dynamic": bool(s.get("source_url")),
+            "count_hint": s.get("count"),
+            "supports_live_validation": bool(s.get("source_url")),
         })
         if s.get("param") and s.get("param") not in src["fields"]:
             src["fields"].append(s.get("param"))
         mode = s.get("submit_mode") or ("value[]" if s.get("kind") == "array" else "value")
         if mode not in src["submit_modes"]:
             src["submit_modes"].append(mode)
-        if s.get("option_filter"):
-            src["option_filter"] = dict(s.get("option_filter") or {})
-        if s.get("evidence"):
-            src["evidence"] = list(s.get("evidence") or [])
     return sources
 
 
@@ -186,8 +185,8 @@ def build_skill_interface(api_request: dict | None, *,
                           required_fields: list[str] | None = None) -> dict:
     """Build a stable public interface from the current api_request.
 
-    The function intentionally avoids credential values, request body values and
-    option labels. Those already live in runtime/private request metadata.
+    The function intentionally avoids credentials, endpoints, request body values and
+    option labels. Those live only in runtime/private request metadata.
     """
     apir = api_request or {}
     params = _params(apir)
