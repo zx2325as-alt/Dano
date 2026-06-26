@@ -50,14 +50,30 @@ export interface JSONSchemaProperty {
 
 export interface ToolOption {
   label: string;
-  value: string;
+  value: string | number | boolean | null;
 }
+
+export type OptionSourceStatus =
+  | "ok"
+  | "empty"
+  | "not_dynamic"
+  | "auth_expired"
+  | "permission_denied"
+  | "source_not_found"
+  | "source_unavailable"
+  | "rate_limited"
+  | "network_error"
+  | "invalid_response"
+  | "invalid_shape"
+  | "source_error";
 
 export interface ToolOptionsResponse {
   field: string;
   count: number;
   options: ToolOption[];
   submit_mode?: string;
+  source_status?: OptionSourceStatus | string;
+  http_status?: number;
   note?: string;
 }
 
