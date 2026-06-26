@@ -49,6 +49,7 @@ jobs:
             back/tests/test_option_query_p1.py \
             back/tests/test_option_query_validation_p1.py \
             back/tests/test_option_query_manifest_p1.py \
+            back/tests/test_option_query_edge_p1.py \
             > pytest-option-p1.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
@@ -65,7 +66,7 @@ jobs:
       - name: Report backend failure
         if: steps.backend_tests.outcome != 'success'
         run: |
-          tail -n 320 pytest-option-p1.log
+          tail -n 340 pytest-option-p1.log
           exit 1
 
   frontend:
