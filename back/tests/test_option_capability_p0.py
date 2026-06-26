@@ -145,7 +145,7 @@ async def test_fetch_field_options_replays_post_json_and_current_auth(monkeypatc
     out = await rc.fetch_field_options(api_request, "会议室", base_url="https://oa.example")
 
     assert out["source_status"] == "ok"
-    assert out["options"] == [{"label": "会议室A", "value": 1}]
+    assert out["options"] == [{"label": "会议室A", "value": "1"}]
     assert _Client.calls[0]["method"] == "POST"
     assert _Client.calls[0]["json"] == {"date": "2026-06-26"}
     assert _Client.calls[0]["headers"]["Authorization"] == "Bearer current"
