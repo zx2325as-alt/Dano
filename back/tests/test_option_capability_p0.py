@@ -9,13 +9,14 @@ import dano.execution.page  # noqa: F401
 from dano.execution.page import request_capture as rc
 
 
-def test_suggest_selects_preserves_recorded_source_method_and_body() -> None:
+def test_suggest_selects_preserves_complete_recorded_source_request() -> None:
     submit = '{"approverId":12}'
     reads = [{
         "method": "POST",
         "url": "https://oa.example/api/user/search",
         "post_data": '{"deptId":7,"keyword":""}',
         "content_type": "application/json",
+        "auth_headers": {"Authorization": "Bearer recorded", "X-Tenant-Id": "7"},
         "json": {"rows": [{"userId": 12, "nickName": "张经理"}]},
     }]
 
@@ -25,6 +26,8 @@ def test_suggest_selects_preserves_recorded_source_method_and_body() -> None:
     assert out[0]["source_method"] == "POST"
     assert json.loads(out[0]["source_post_data"]) == {"deptId": 7, "keyword": ""}
     assert out[0]["source_content_type"] == "application/json"
+    assert out[0]["source_auth_headers"]["X-Tenant-Id"] == "7"
+    assert out[0]["source_records_path"] == ["rows"]
 
 
 class _Response:
@@ -56,19 +59,22 @@ class _Client:
 
 
 @pytest.mark.asyncio
-async def test_fetch_field_options_replays_post_json(monkeypatch) -> None:
+async def test_fetch_field_options_replays_post_json_and_current_auth(monkeypatch) -> None:
     import httpx
 
     _Client.calls = []
     _Client.response = _Response(200, {"rows": [{"id": 1, "name": "会议室A"}]})
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
     api_request = {
+        "auth_headers": {"Authorization": "Bearer current"},
         "selects": [{
             "param": "会议室",
             "source_url": "/api/room/search",
             "source_method": "POST",
             "source_post_data": '{"date":"2026-06-26"}',
             "source_content_type": "application/json",
+            "source_auth_headers": {"Authorization": "Bearer recorded", "X-Tenant-Id": "7"},
+            "source_records_path": ["rows"],
             "value_key": "id",
             "label_key": "name",
         }]
@@ -80,6 +86,55 @@ async def test_fetch_field_options_replays_post_json(monkeypatch) -> None:
     assert out["options"] == [{"label": "会议室A", "value": 1}]
     assert _Client.calls[0]["method"] == "POST"
     assert _Client.calls[0]["json"] == {"date": "2026-06-26"}
+    assert _Client.calls[0]["headers"]["Authorization"] == "Bearer current"
+    assert _Client.calls[0]["headers"]["X-Tenant-Id"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_treats_recorded_empty_list_as_valid(monkeypatch) -> None:
+    import httpx
+
+    _Client.calls = []
+    _Client.response = _Response(200, {"data": {"records": []}})
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "会议室",
+            "source_url": "/api/room/search",
+            "source_records_path": ["data", "records"],
+            "value_key": "id",
+            "label_key": "name",
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "会议室", base_url="https://oa.example")
+
+    assert out["options"] == []
+    assert out["source_status"] == "empty"
+    assert out["note"] == "当前条件下没有可选项"
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_reports_response_shape_drift(monkeypatch) -> None:
+    import httpx
+
+    _Client.response = _Response(200, {"data": {"itemsAfterUpgrade": []}})
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "会议室",
+            "source_url": "/api/room/search",
+            "source_records_path": ["data", "records"],
+            "value_key": "id",
+            "label_key": "name",
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "会议室", base_url="https://oa.example")
+
+    assert out["options"] == []
+    assert out["source_status"] == "invalid_shape"
+    assert "结构" in out["note"]
 
 
 @pytest.mark.asyncio
@@ -96,6 +151,7 @@ async def test_fetch_field_options_reports_auth_expired_without_snapshot_fallbac
             "source_method": "POST",
             "source_post_data": "{}",
             "source_content_type": "application/json",
+            "source_records_path": ["rows"],
             "value_key": "id",
             "label_key": "name",
         }]
@@ -126,6 +182,7 @@ async def test_execute_select_fails_closed_when_source_unavailable(monkeypatch) 
             "source_method": "POST",
             "source_post_data": "{}",
             "source_content_type": "application/json",
+            "source_records_path": ["rows"],
             "value_key": "id",
             "label_key": "name",
         }],
@@ -135,3 +192,41 @@ async def test_execute_select_fails_closed_when_source_unavailable(monkeypatch) 
 
     assert out["ok"] is False
     assert "没有读取候选项的权限" in out["detail"]
+
+
+class _RecordedRequest:
+    method = "POST"
+    post_data = '{"deptId":7}'
+    headers = {
+        "content-type": "application/json",
+        "authorization": "Bearer source-token",
+        "x-tenant-id": "7",
+        "user-agent": "browser-noise",
+    }
+
+
+class _RecordedResponse:
+    request = _RecordedRequest()
+    url = "https://oa.example/api/user/search"
+    status = 200
+    headers = {"content-type": "application/json"}
+
+    async def json(self):
+        return {"rows": [{"userId": 12, "nickName": "张经理"}]}
+
+
+@pytest.mark.asyncio
+async def test_recorder_captures_option_source_request_metadata() -> None:
+    from dano.execution.page.recorder import RecordSession
+
+    session = RecordSession()
+    await session._on_response(_RecordedResponse())
+
+    assert len(session.reads) == 1
+    read = session.reads[0]
+    assert read["method"] == "POST"
+    assert read["post_data"] == '{"deptId":7}'
+    assert read["content_type"] == "application/json"
+    assert read["auth_headers"]["authorization"] == "Bearer source-token"
+    assert read["auth_headers"]["x-tenant-id"] == "7"
+    assert "user-agent" not in read["auth_headers"]
