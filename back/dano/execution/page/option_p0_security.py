@@ -15,17 +15,20 @@ they cannot redirect credentials to another origin by themselves.
 """
 from __future__ import annotations
 
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 _INSTALLED = False
 _SAFE_OPTION_METHODS = {"GET", "POST"}
 
 
 def _origin(url: str) -> tuple[str, str, int | None] | None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        port = parsed.port
+    except ValueError:
         return None
-    port = parsed.port
     if port is None:
         port = 443 if parsed.scheme == "https" else 80
     return parsed.scheme.lower(), parsed.hostname.lower(), port
@@ -36,7 +39,7 @@ def _effective_base_url(select: dict, base_url: str) -> str:
 
 
 def _validate_source_request(select: dict, base_url: str) -> dict | None:
-    from dano.execution.page.option_p0_quality import sensitive_source_body_keys
+    from dano.execution.page.option_p0_quality import _is_sensitive_key, sensitive_source_body_keys
 
     method = str(select.get("source_method") or "GET").upper()
     if method not in _SAFE_OPTION_METHODS:
@@ -84,13 +87,38 @@ def _validate_source_request(select: dict, base_url: str) -> dict | None:
             "message": "候选来源 URL 为空",
         }
 
-    parsed_raw = urlparse(raw_url)
+    try:
+        parsed_raw = urlparse(raw_url)
+        # Accessing hostname/port validates malformed netloc and port values.
+        _ = parsed_raw.hostname
+        _ = parsed_raw.port
+    except ValueError:
+        return {
+            "ok": False,
+            "status": 0,
+            "source_status": "invalid_source_url",
+            "message": "候选来源 URL 格式无效",
+        }
+
     if parsed_raw.username is not None or parsed_raw.password is not None:
         return {
             "ok": False,
             "status": 0,
             "source_status": "credential_in_url",
             "message": "候选来源 URL 不允许包含用户名或密码",
+        }
+
+    raw_sensitive_query_keys = [
+        key for key, _value in parse_qsl(parsed_raw.query, keep_blank_values=True)
+        if _is_sensitive_key(key)
+    ]
+    if raw_sensitive_query_keys:
+        return {
+            "ok": False,
+            "status": 0,
+            "source_status": "sensitive_request",
+            "message": "候选来源 URL 查询参数包含凭证字段，已禁止重放",
+            "sensitive_keys": list(dict.fromkeys(raw_sensitive_query_keys)),
         }
 
     if parsed_raw.scheme and parsed_raw.scheme.lower() not in {"http", "https"}:
