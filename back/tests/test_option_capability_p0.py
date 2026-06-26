@@ -9,14 +9,15 @@ import dano.execution.page  # noqa: F401
 from dano.execution.page import request_capture as rc
 
 
-def test_suggest_selects_preserves_complete_recorded_source_request() -> None:
+def test_suggest_selects_preserves_safe_recorded_source_request() -> None:
     submit = '{"approverId":12}'
     reads = [{
         "method": "POST",
         "url": "https://oa.example/api/user/search",
         "post_data": '{"deptId":7,"keyword":""}',
         "content_type": "application/json",
-        "auth_headers": {"Authorization": "Bearer recorded", "X-Tenant-Id": "7"},
+        "source_headers": {"X-Tenant-Id": "7"},
+        "records_path": ["rows"],
         "json": {"rows": [{"userId": 12, "nickName": "张经理"}]},
     }]
 
@@ -26,8 +27,69 @@ def test_suggest_selects_preserves_complete_recorded_source_request() -> None:
     assert out[0]["source_method"] == "POST"
     assert json.loads(out[0]["source_post_data"]) == {"deptId": 7, "keyword": ""}
     assert out[0]["source_content_type"] == "application/json"
-    assert out[0]["source_auth_headers"]["X-Tenant-Id"] == "7"
+    assert out[0]["source_headers"] == {"X-Tenant-Id": "7"}
     assert out[0]["source_records_path"] == ["rows"]
+
+
+def test_build_api_request_keeps_option_source_request_metadata() -> None:
+    req = {
+        "method": "POST",
+        "url": "https://oa.example/api/leave/submit",
+        "post_data": '{"approverId":12}',
+        "content_type": "application/json",
+        "headers": {"Authorization": "Bearer current"},
+    }
+    select = {
+        "path": "approverId",
+        "tokens": ["approverId"],
+        "source_url": "https://oa.example/api/user/search",
+        "source_method": "POST",
+        "source_post_data": '{"deptId":7}',
+        "source_content_type": "application/json",
+        "source_headers": {"X-Tenant-Id": "7"},
+        "source_records_path": ["rows"],
+        "value_key": "userId",
+        "label_key": "nickName",
+    }
+
+    compiled = rc.build_api_request(req, {"approverId": "审批人"}, selects=[select])
+
+    assert compiled is not None
+    compiled_select = compiled["selects"][0]
+    assert compiled_select["source_method"] == "POST"
+    assert compiled_select["source_post_data"] == '{"deptId":7}'
+    assert compiled_select["source_headers"] == {"X-Tenant-Id": "7"}
+    assert compiled_select["source_records_path"] == ["rows"]
+
+
+def test_small_primitive_string_enum_is_recognized_with_ui_evidence() -> None:
+    submit = '{"priority":"HIGH"}'
+    reads = [{
+        "method": "GET",
+        "url": "https://oa.example/api/priorities",
+        "records_path": [],
+        "json": ["LOW", "NORMAL", "HIGH"],
+    }]
+
+    out = rc.suggest_selects(submit, reads, {"优先级": "HIGH"})
+
+    assert len(out) == 1
+    assert out[0]["primitive"] is True
+    assert out[0]["path"] == "priority"
+    assert out[0]["source_records_path"] == []
+    assert out[0]["options"][-1] == {"label": "HIGH", "value": "HIGH"}
+
+
+def test_ambiguous_primitive_sources_are_not_auto_bound() -> None:
+    submit = '{"priority":"HIGH"}'
+    reads = [
+        {"method": "GET", "url": "/a", "json": ["LOW", "HIGH"]},
+        {"method": "GET", "url": "/b", "json": ["LOW", "HIGH"]},
+    ]
+
+    out = rc.suggest_selects(submit, reads, {"优先级": "HIGH"})
+
+    assert out == []
 
 
 class _Response:
@@ -73,7 +135,7 @@ async def test_fetch_field_options_replays_post_json_and_current_auth(monkeypatc
             "source_method": "POST",
             "source_post_data": '{"date":"2026-06-26"}',
             "source_content_type": "application/json",
-            "source_auth_headers": {"Authorization": "Bearer recorded", "X-Tenant-Id": "7"},
+            "source_headers": {"X-Tenant-Id": "7"},
             "source_records_path": ["rows"],
             "value_key": "id",
             "label_key": "name",
@@ -88,6 +150,64 @@ async def test_fetch_field_options_replays_post_json_and_current_auth(monkeypatc
     assert _Client.calls[0]["json"] == {"date": "2026-06-26"}
     assert _Client.calls[0]["headers"]["Authorization"] == "Bearer current"
     assert _Client.calls[0]["headers"]["X-Tenant-Id"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_supports_root_primitive_list(monkeypatch) -> None:
+    import httpx
+
+    _Client.calls = []
+    _Client.response = _Response(200, ["LOW", "NORMAL", "HIGH"])
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "优先级",
+            "source_url": "/api/priorities",
+            "source_records_path": [],
+            "primitive": True,
+            "value_key": None,
+            "label_key": None,
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "优先级", base_url="https://oa.example")
+
+    assert out["source_status"] == "ok"
+    assert out["options"] == [
+        {"label": "LOW", "value": "LOW"},
+        {"label": "NORMAL", "value": "NORMAL"},
+        {"label": "HIGH", "value": "HIGH"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_primitive_enum_validates_live_candidates(monkeypatch) -> None:
+    import httpx
+
+    _Client.response = _Response(200, ["LOW", "NORMAL", "HIGH"])
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "优先级",
+            "source_url": "/api/priorities",
+            "source_records_path": [],
+            "primitive": True,
+            "value_key": None,
+            "label_key": None,
+        }]
+    }
+
+    fields, overrides = await rc._resolve_selects(
+        api_request,
+        {"优先级": "HIGH"},
+        base_url="https://oa.example",
+        storage_state=None,
+        token_key=None,
+        verify=True,
+    )
+
+    assert fields["优先级"] == "HIGH"
+    assert overrides == {}
 
 
 @pytest.mark.asyncio
@@ -200,6 +320,7 @@ class _RecordedRequest:
     headers = {
         "content-type": "application/json",
         "authorization": "Bearer source-token",
+        "x-api-token": "secret",
         "x-tenant-id": "7",
         "user-agent": "browser-noise",
     }
@@ -215,8 +336,13 @@ class _RecordedResponse:
         return {"rows": [{"userId": 12, "nickName": "张经理"}]}
 
 
+class _RecordedEmptyResponse(_RecordedResponse):
+    async def json(self):
+        return {"data": {"records": []}}
+
+
 @pytest.mark.asyncio
-async def test_recorder_captures_option_source_request_metadata() -> None:
+async def test_recorder_captures_source_request_without_credentials() -> None:
     from dano.execution.page.recorder import RecordSession
 
     session = RecordSession()
@@ -227,6 +353,19 @@ async def test_recorder_captures_option_source_request_metadata() -> None:
     assert read["method"] == "POST"
     assert read["post_data"] == '{"deptId":7}'
     assert read["content_type"] == "application/json"
-    assert read["auth_headers"]["authorization"] == "Bearer source-token"
-    assert read["auth_headers"]["x-tenant-id"] == "7"
-    assert "user-agent" not in read["auth_headers"]
+    assert read["source_headers"] == {"x-tenant-id": "7"}
+    assert read["records_path"] == ["rows"]
+
+
+@pytest.mark.asyncio
+async def test_recorder_keeps_legitimate_empty_option_response() -> None:
+    from dano.execution.page.recorder import RecordSession
+
+    session = RecordSession()
+    await session._on_response(_RecordedEmptyResponse())
+
+    assert len(session.reads) == 1
+    read = session.reads[0]
+    assert read["count"] == 0
+    assert read["records_path"] == ["data", "records"]
+    assert read["source_headers"] == {"x-tenant-id": "7"}
