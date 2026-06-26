@@ -1,0 +1,39 @@
+name: Update Option P1 Regressions
+
+on:
+  push:
+    branches:
+      - "fix/option-capability-p1"
+    paths:
+      - "scripts/update_option_p1_regressions.py"
+      - ".github/workflows/update-option-p1-regressions.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/option-capability-p1
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Update regression expectations
+        run: python scripts/update_option_p1_regressions.py
+      - name: Commit regression updates
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No regression changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add back/tests/test_request_capture.py
+          git commit -m "test(options): align regressions with private option contract"
+          git push origin HEAD:fix/option-capability-p1
