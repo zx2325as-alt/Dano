@@ -396,12 +396,23 @@ def _infer_source_input_bindings(read: dict, samples: dict | None) -> list[dict]
 def _apply_read_metadata(select: dict, read: dict, samples: dict | None = None) -> None:
     select["source_method"] = str(read.get("method") or "GET").upper()
     raw_url = str(read.get("url") or select.get("source_url") or "")
-    parsed = urlparse(raw_url)
+    # Sanitize before splitting query metadata. Otherwise moving query parameters out
+    # of source_url could bypass the P0 compile guard and persist a raw token in
+    # source_query. Sensitive sources keep the redacted URL marker so runtime blocks
+    # replay of an incomplete authentication flow.
+    from dano.execution.page.option_p0_compile_guard import _sanitize_source_url
+
+    sanitized_url, url_markers = _sanitize_source_url(raw_url)
+    parsed = urlparse(sanitized_url)
     clean_url = parsed._replace(query="", fragment="").geturl()
-    select["source_url"] = clean_url or raw_url
     source_query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     if source_query:
         select["source_query"] = source_query
+    select.update(url_markers)
+    if url_markers.get("source_sensitive_query_keys") or url_markers.get("source_url_had_credentials"):
+        select["source_url"] = sanitized_url
+    else:
+        select["source_url"] = clean_url or sanitized_url
     if read.get("post_data") not in (None, ""):
         select["source_post_data"] = read.get("post_data")
     if read.get("content_type"):
