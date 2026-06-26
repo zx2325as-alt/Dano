@@ -53,6 +53,8 @@ def _binding_value(binding: dict, *, query: str, context: dict, limit: int, offs
         return limit
     if source == "offset":
         return offset
+    if source == "page":
+        return int(binding.get("page_base", 1)) + (offset // max(limit, 1))
     if source == "const":
         return binding.get("value", binding.get("default"))
     if source.startswith("context."):
@@ -188,7 +190,7 @@ def _apply_source_bindings(select: dict, *, query: str, context: dict,
             errors.append(f"绑定 {index + 1} 不是对象")
             continue
         source = str(binding.get("from") or "")
-        if source not in {"query", "limit", "offset", "const"} and not source.startswith("context."):
+        if source not in {"query", "limit", "offset", "page", "const"} and not source.startswith("context."):
             errors.append(f"绑定 {index + 1} 的来源不受支持")
             continue
         value = _binding_value(binding, query=query, context=context, limit=limit, offset=offset)
@@ -203,7 +205,7 @@ def _apply_source_bindings(select: dict, *, query: str, context: dict,
             continue
         if source == "query":
             used_query = True
-        if source in {"limit", "offset"}:
+        if source in {"limit", "offset", "page"}:
             used_pagination = True
         target = str(binding.get("target") or "query")
         tokens = _tokens(binding)
@@ -429,7 +431,10 @@ async def query_field_options(api_request: dict, field: str, *, base_url: str = 
                 collected.append(option)
         last_raw_count = int(current["raw_count"])
         consumed += last_raw_count
-        if len(collected) >= limit or last_raw_count < limit or last_raw_count == 0:
+        # Do not consume a second upstream page once this response has matches:
+        # advancing past a partly-used page would silently drop candidates. Empty pages
+        # may be skipped (bounded) so local filtering can still find a visible result.
+        if collected or last_raw_count < limit or last_raw_count == 0:
             break
         next_page_offset = offset + consumed
         if next_page_offset > MAX_OFFSET:

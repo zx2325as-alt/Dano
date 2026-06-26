@@ -338,8 +338,18 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
         sourceHint = (
           <Space size={4} style={{ marginTop: 4 }}>
             <Typography.Text type="secondary">{state.message || "当前条件下没有可选项"}</Typography.Text>
-            <Button type="link" size="small" onClick={() => loadOptions(key, p, { force: true })}>重新加载</Button>
+            {optionHasMore[key] ? (
+              <Button type="link" size="small" loading={!!optionLoading[key]}
+                      onClick={() => loadMoreOptions(key, p)}>继续查找</Button>
+            ) : (
+              <Button type="link" size="small" onClick={() => loadOptions(key, p, { force: true })}>重新加载</Button>
+            )}
           </Space>
+        );
+      } else if (dynamic && optionHasMore[key]) {
+        sourceHint = (
+          <Button type="link" size="small" loading={!!optionLoading[key]}
+                  onClick={() => loadMoreOptions(key, p)}>加载更多候选</Button>
         );
       }
     } else if (isDate(hint)) {
