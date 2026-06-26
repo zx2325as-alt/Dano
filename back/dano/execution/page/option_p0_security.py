@@ -6,6 +6,7 @@ module enforces the narrow read contract expected from an option source:
 * only GET and POST are accepted;
 * only HTTP(S) absolute URLs are accepted;
 * credentials embedded in a URL are rejected;
+* credentials embedded in a recorded request body are rejected;
 * when a target-system base URL is known, the option source must be same-origin.
 
 Relative URLs remain compatible when the legacy caller has not supplied ``base_url``;
@@ -31,6 +32,8 @@ def _origin(url: str) -> tuple[str, str, int | None] | None:
 
 
 def _validate_source_request(select: dict, base_url: str) -> dict | None:
+    from dano.execution.page.option_p0_quality import sensitive_source_body_keys
+
     method = str(select.get("source_method") or "GET").upper()
     if method not in _SAFE_OPTION_METHODS:
         return {
@@ -38,6 +41,16 @@ def _validate_source_request(select: dict, base_url: str) -> dict | None:
             "status": 0,
             "source_status": "unsafe_method",
             "message": f"候选来源使用了不安全的方法 {method}；候选查询只允许 GET 或 POST",
+        }
+
+    sensitive_keys = sensitive_source_body_keys(select)
+    if sensitive_keys:
+        return {
+            "ok": False,
+            "status": 0,
+            "source_status": "sensitive_request",
+            "message": "候选来源请求体包含凭证或验证码字段，已禁止重放",
+            "sensitive_keys": sensitive_keys,
         }
 
     raw_url = str(select.get("source_url") or "").strip()
@@ -107,6 +120,11 @@ def install_option_p0_security() -> None:
         return
 
     from dano.execution.page import option_p0
+
+    # Keep recorder/runtime method policy aligned. PUT/PATCH may be read-like in some
+    # systems, but replaying them as a candidate lookup is too risky for P0.
+    option_p0._ALLOWED_SOURCE_METHODS.clear()
+    option_p0._ALLOWED_SOURCE_METHODS.update(_SAFE_OPTION_METHODS)
 
     original = option_p0._request_source_json
 
