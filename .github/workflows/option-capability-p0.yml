@@ -43,6 +43,7 @@ jobs:
           python -m pytest -q --tb=short \
             back/tests/test_option_capability_p0.py \
             back/tests/test_option_capability_security_p0.py \
+            back/tests/test_option_capability_quality_p0.py \
             > pytest-option-p0.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
@@ -59,7 +60,7 @@ jobs:
       - name: Report backend test failure
         if: steps.backend_tests.outcome != 'success'
         run: |
-          tail -n 160 pytest-option-p0.log
+          tail -n 200 pytest-option-p0.log
           exit 1
 
   frontend:
