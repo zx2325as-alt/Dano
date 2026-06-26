@@ -9,6 +9,19 @@ from dano.execution.page.skill_interface import build_skill_interface
 from dano.execution.page.request_capture import build_api_request, build_api_workflow
 
 
+def _materialize_source_query(source: dict, name_by_path: dict[str, str]) -> None:
+    protocol = source.get("query_protocol")
+    if not isinstance(protocol, dict):
+        return
+    for dependency in protocol.get("dependencies") or []:
+        if not isinstance(dependency, dict):
+            continue
+        field_path = dependency.get("field_path")
+        if field_path and name_by_path.get(field_path):
+            dependency["field"] = name_by_path[field_path]
+        dependency.pop("field_path", None)
+
+
 def _materialize_ir(transaction_ir: dict | None, param_map: dict | None,
                     selects: list[dict] | None, identity: list[dict] | None) -> dict:
     """Return a publish-time IR: user renames applied, only exposed inputs kept."""
@@ -38,19 +51,28 @@ def _materialize_ir(transaction_ir: dict | None, param_map: dict | None,
     ir["inputs"] = kept_inputs
 
     bindings: list[dict] = []
-    for b in ir.get("bindings") or []:
-        if b.get("target_path") in name_by_path:
-            b["input"] = name_by_path[b["target_path"]]
-        if (not kept_names) or b.get("input") in kept_names:
-            bindings.append(b)
-            if b.get("source_id"):
-                kept_sources.add(b["source_id"])
+    for binding in ir.get("bindings") or []:
+        if binding.get("target_path") in name_by_path:
+            binding["input"] = name_by_path[binding["target_path"]]
+        if (not kept_names) or binding.get("input") in kept_names:
+            bindings.append(binding)
+            if binding.get("source_id"):
+                kept_sources.add(binding["source_id"])
     ir["bindings"] = bindings
-    ir["sources"] = [s for s in (ir.get("sources") or []) if not kept_sources or s.get("id") in kept_sources]
+
+    sources = [source for source in (ir.get("sources") or [])
+               if not kept_sources or source.get("id") in kept_sources]
+    for source in sources:
+        _materialize_source_query(source, name_by_path)
+    ir["sources"] = sources
+
     if identity is not None:
         ir["identity"] = copy.deepcopy(identity)
     ir.setdefault("compile", {})
     ir["compile"]["param_paths"] = sorted(selected_paths)
+    ir["compile"]["query_source_count"] = sum(
+        1 for source in sources if source.get("query_protocol")
+    )
     return ir
 
 
