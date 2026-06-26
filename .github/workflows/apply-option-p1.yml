@@ -1,0 +1,43 @@
+name: Apply Option Capability P1
+
+on:
+  push:
+    branches:
+      - "fix/option-capability-p1"
+    paths:
+      - "scripts/apply_option_p1.py"
+      - ".github/workflows/apply-option-p1.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/option-capability-p1
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply deterministic P1 patch
+        run: python scripts/apply_option_p1.py
+      - name: Commit patched files
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No patch changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add back/dano/gateway/app.py \
+                  back/dano/orchestrator/orchestrator.py \
+                  back/dano/catalog/manifest.py \
+                  skillfrontend/src/api/skills.ts \
+                  skillfrontend/src/components/InvokeDrawer.tsx
+          git commit -m "feat(options): add private searchable option broker"
+          git push origin HEAD:fix/option-capability-p1
