@@ -51,6 +51,8 @@ jobs:
             back/tests/test_option_query_manifest_p1.py \
             back/tests/test_option_query_edge_p1.py \
             back/tests/test_option_query_inference_p2.py \
+            back/tests/test_option_query_validation_fallback_p2.py \
+            back/tests/test_transaction_ir_records_path_p2.py \
             > pytest-option-inference-p2.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
@@ -67,7 +69,7 @@ jobs:
       - name: Report backend failure
         if: steps.backend_tests.outcome != 'success'
         run: |
-          tail -n 380 pytest-option-inference-p2.log
+          tail -n 420 pytest-option-inference-p2.log
           exit 1
 
   frontend:
