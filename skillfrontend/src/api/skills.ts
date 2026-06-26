@@ -50,7 +50,7 @@ export interface JSONSchemaProperty {
 
 export interface ToolOption {
   label: string;
-  value: string | number | boolean | null;
+  value: string | number;
 }
 
 export type OptionSourceStatus =
