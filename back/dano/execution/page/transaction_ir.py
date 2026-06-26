@@ -106,7 +106,9 @@ def _strip_empty(value: Any) -> Any:
         out = {}
         for k, v in value.items():
             vv = _strip_empty(v)
-            if vv in (None, "", [], {}):
+            # ``records_path=[]`` is not empty metadata: it explicitly means that the
+            # response root itself is the candidate array. Preserve that distinction.
+            if vv in (None, "", [], {}) and not (k == "records_path" and v == []):
                 continue
             out[k] = vv
         return out
@@ -132,6 +134,16 @@ def _valid_tokens(path: Any) -> bool:
     if not isinstance(path, list) or not path:
         return False
     return all(
+        not isinstance(token, bool)
+        and isinstance(token, (str, int))
+        and (not isinstance(token, int) or token >= 0)
+        and (not isinstance(token, str) or bool(token))
+        for token in path
+    )
+
+
+def _valid_records_path(path: Any) -> bool:
+    return isinstance(path, list) and all(
         not isinstance(token, bool)
         and isinstance(token, (str, int))
         and (not isinstance(token, int) or token >= 0)
@@ -209,6 +221,8 @@ def validate_transaction_ir(ir: dict | None) -> list[str]:
         method = str((src or {}).get("method") or "GET").upper()
         if method not in {"GET", "POST", "PUT", "PATCH"}:
             issues.append(f"sources[{i}].method is unsupported")
+        if "records_path" in (src or {}) and not _valid_records_path((src or {}).get("records_path")):
+            issues.append(f"sources[{i}].records_path must be a token path or [] for a root list")
         issues.extend(_validate_query_protocol((src or {}).get("query_protocol"), f"sources[{i}].query_protocol"))
         inference = (src or {}).get("inference")
         if inference:
