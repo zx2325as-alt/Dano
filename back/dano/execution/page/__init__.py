@@ -25,10 +25,11 @@ from dano.execution.page.option_query_p1_contract import install_option_query_p1
 from dano.execution.page.option_query_inference_p2 import install_option_query_inference_p2
 from dano.execution.page.option_query_validation_p2 import install_option_query_validation_p2
 from dano.execution.page.option_reference_p3 import install_option_reference_p3
+from dano.execution.page.transaction_authority_p4 import install_transaction_authority_p4
 
 # P0 establishes safe replay and fail-closed candidate integrity. P1 defines the typed
-# query runtime and public contract. P2 may infer only evidence-proven query relations.
-# P3 marks newly compiled dynamic selects as accepting only broker-issued opaque refs.
+# query runtime and public contract. P2 infers evidence-proven relations. P3 moves target
+# IDs behind opaque references. P4 seals the final executable artifact to Transaction IR.
 install_option_p0()
 install_option_p0_compat()
 install_option_p0_quality()
@@ -41,6 +42,7 @@ install_option_query_p1_contract()
 install_option_query_inference_p2()
 install_option_query_validation_p2()
 install_option_reference_p3()
+install_transaction_authority_p4()
 
 __all__ = ["FakePageDriver", "PageDriver", "PageActionRuntime", "build_page_runtime",
            "scout_dom", "to_recorded_steps"]
