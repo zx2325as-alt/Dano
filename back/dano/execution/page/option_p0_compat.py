@@ -2,7 +2,7 @@
 
 New recordings carry method/body/records-path metadata and use the strict P0 runtime.
 Legacy assets only contain ``source_url`` and historically relied on ``_fetch_list``;
-keep that behavior so existing Skills and tests are not forced onto an unverifiable
+keep that behavior so existing Skills and callers are not forced onto an unverifiable
 request shape during the P0 rollout.
 """
 from __future__ import annotations
@@ -67,5 +67,16 @@ def install_option_p0_compat() -> None:
             "message": "",
         }
 
+    strict_resolve_selects = rc._resolve_selects
+
+    async def resolve_selects_compat(*args, **kwargs):
+        try:
+            return await strict_resolve_selects(*args, **kwargs)
+        except ValueError as exc:
+            # Keep the long-standing public error wording used by callers and tests.
+            message = str(exc).replace("不在当前候选项中", "不在候选项中")
+            raise ValueError(message) from exc
+
     option_p0._fetch_options = fetch_options_compat
+    rc._resolve_selects = resolve_selects_compat
     _INSTALLED = True
