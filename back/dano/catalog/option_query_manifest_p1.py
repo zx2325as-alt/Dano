@@ -9,8 +9,8 @@ _INSTALLED = False
 
 
 def option_query_schema(select: dict | None) -> dict:
-    protocol = (select or {}).get("option_query") or {}
-    if not isinstance(protocol, dict):
+    protocol = (select or {}).get("option_query")
+    if not isinstance(protocol, dict) or not protocol:
         return {}
 
     search = protocol.get("search") if isinstance(protocol.get("search"), dict) else None
