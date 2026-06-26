@@ -59,6 +59,7 @@ jobs:
             back/tests/test_transaction_ir_records_path_p2.py \
             back/tests/test_option_query_review_p2.py \
             back/tests/test_option_query_review_ir_p2.py \
+            back/tests/test_option_query_gateway_review_p2.py \
             > pytest-option-inference-review-p2.log 2>&1 || status=$?
           python -m pytest -q --tb=short \
             back/tests/test_request_capture.py \
@@ -75,7 +76,7 @@ jobs:
       - name: Report backend failure
         if: steps.backend_tests.outcome != 'success'
         run: |
-          tail -n 460 pytest-option-inference-review-p2.log
+          tail -n 500 pytest-option-inference-review-p2.log
           exit 1
 
   frontend:
