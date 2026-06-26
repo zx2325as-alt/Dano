@@ -15,14 +15,16 @@ from dano.execution.page.runtime import PageActionRuntime, build_page_runtime
 from dano.execution.page.scout import scout_dom, to_recorded_steps
 from dano.execution.page.option_p0 import install_option_p0
 from dano.execution.page.option_p0_compat import install_option_p0_compat
+from dano.execution.page.option_p0_integrity import install_option_p0_integrity
 from dano.execution.page.option_p0_quality import install_option_p0_quality
 from dano.execution.page.option_p0_security import install_option_p0_security
 
-# New recordings use complete source metadata, privacy filtering and strict live
-# validation; legacy GET-only assets remain executable during the P0 migration.
+# New recordings use complete source metadata, privacy filtering, candidate-integrity
+# checks and strict live validation; legacy GET-only assets remain executable during P0.
 install_option_p0()
 install_option_p0_compat()
 install_option_p0_quality()
+install_option_p0_integrity()
 install_option_p0_security()
 
 __all__ = ["FakePageDriver", "PageDriver", "PageActionRuntime", "build_page_runtime",
