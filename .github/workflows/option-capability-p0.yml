@@ -30,7 +30,11 @@ jobs:
       - name: Install backend
         run: python -m pip install -e './back[dev]'
       - name: Run option and request-capture tests
-        run: python -m pytest back/tests/test_option_capability_p0.py back/tests/test_request_capture.py
+        run: >-
+          python -m pytest
+          back/tests/test_option_capability_p0.py
+          back/tests/test_skill_interface_privacy_p0.py
+          back/tests/test_request_capture.py
 
   frontend:
     runs-on: ubuntu-latest
