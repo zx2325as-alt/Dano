@@ -1,8 +1,8 @@
 """Transaction-level IR for request-captured page skills.
 
-The IR is the stable capture model.  It describes user-facing inputs,
-option sources, bindings into the target request body, identity values and
-constants before it is compiled back to the legacy ``api_request`` shape.
+The IR is the stable capture model. It describes user-facing inputs, option sources,
+bindings into the target request body, identity values and constants before it is
+compiled back to the legacy ``api_request`` shape.
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ class SourceSpec:
     url: str
     value_key: str = ""
     label_key: str = ""
+    method: str = "GET"
+    records_path: list[str | int] = field(default_factory=list)
+    query_protocol: dict = field(default_factory=dict)
+    inference: dict = field(default_factory=dict)
     count: int | None = None
     options: list[dict] = field(default_factory=list)
     option_filter: dict | None = None
@@ -124,6 +128,56 @@ def request_path(url: str | None) -> str:
     return u or "/"
 
 
+def _valid_tokens(path: Any) -> bool:
+    if not isinstance(path, list) or not path:
+        return False
+    return all(
+        not isinstance(token, bool)
+        and isinstance(token, (str, int))
+        and (not isinstance(token, int) or token >= 0)
+        and (not isinstance(token, str) or bool(token))
+        for token in path
+    )
+
+
+def _validate_query_protocol(protocol: Any, prefix: str) -> list[str]:
+    if protocol in (None, {}):
+        return []
+    if not isinstance(protocol, dict):
+        return [f"{prefix} must be an object"]
+    issues: list[str] = []
+    for section in ("search", "pagination", "validation"):
+        spec = protocol.get(section)
+        if spec is None:
+            continue
+        if not isinstance(spec, dict):
+            issues.append(f"{prefix}.{section} must be an object")
+            continue
+        if not _valid_tokens(spec.get("path")):
+            issues.append(f"{prefix}.{section}.path must be a non-empty token path")
+        location = spec.get("location") or "body"
+        if location not in {"body", "json", "query", "form"}:
+            issues.append(f"{prefix}.{section}.location is unsupported")
+    pagination = protocol.get("pagination")
+    response = protocol.get("response") or {}
+    if isinstance(pagination, dict) and pagination.get("mode") == "cursor":
+        if not isinstance(response, dict) or not _valid_tokens(response.get("next_cursor_path")):
+            issues.append(f"{prefix}.response.next_cursor_path is required for cursor pagination")
+    dependencies = protocol.get("dependencies") or []
+    if not isinstance(dependencies, list):
+        issues.append(f"{prefix}.dependencies must be an array")
+    else:
+        for index, dependency in enumerate(dependencies):
+            if not isinstance(dependency, dict):
+                issues.append(f"{prefix}.dependencies[{index}] must be an object")
+                continue
+            if not dependency.get("field"):
+                issues.append(f"{prefix}.dependencies[{index}].field is required")
+            if not _valid_tokens(dependency.get("path")):
+                issues.append(f"{prefix}.dependencies[{index}].path must be a non-empty token path")
+    return issues
+
+
 def validate_transaction_ir(ir: dict | None) -> list[str]:
     """Validate the IR graph before trusting it as publish-time provenance."""
     if not isinstance(ir, dict):
@@ -152,6 +206,18 @@ def validate_transaction_ir(ir: dict | None) -> list[str]:
         source_ids.add(sid)
         if not (src or {}).get("url"):
             issues.append(f"sources[{i}].url is required")
+        method = str((src or {}).get("method") or "GET").upper()
+        if method not in {"GET", "POST", "PUT", "PATCH"}:
+            issues.append(f"sources[{i}].method is unsupported")
+        issues.extend(_validate_query_protocol((src or {}).get("query_protocol"), f"sources[{i}].query_protocol"))
+        inference = (src or {}).get("inference")
+        if inference:
+            if not isinstance(inference, dict):
+                issues.append(f"sources[{i}].inference must be an object")
+            else:
+                confidence = inference.get("confidence")
+                if confidence is not None and not (isinstance(confidence, (int, float)) and 0 <= confidence <= 1):
+                    issues.append(f"sources[{i}].inference.confidence must be between 0 and 1")
     for i, binding in enumerate(ir.get("bindings") or []):
         name = str((binding or {}).get("input") or "")
         if name and input_names and name not in input_names:
