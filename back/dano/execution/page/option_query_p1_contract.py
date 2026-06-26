@@ -1,9 +1,9 @@
 """Stable capability projection for the P1 option query protocol.
 
-Clients need to know that remote search or dependencies exist even when the first request
-is intentionally blocked by ``query_required`` or ``missing_dependency``. This wrapper
-adds capability metadata to success and failure responses and rejects cursor protocols
-that cannot produce a next cursor.
+Clients need to know that remote search, dependencies, pagination and exact validation
+exist even when the first request is intentionally blocked by ``query_required`` or
+``missing_dependency``. This wrapper adds the same capability metadata to success and
+failure responses and rejects cursor protocols that cannot produce a next cursor.
 """
 from __future__ import annotations
 
@@ -22,10 +22,13 @@ def _capabilities(select: dict) -> tuple[dict, dict | None]:
     pagination = protocol.get("pagination")
     response = protocol.get("response") or {}
     dependencies = protocol.get("dependencies") or []
+    validation = protocol.get("validation")
     if search is not None and not isinstance(search, dict):
         return {}, {"source_status": "invalid_query_protocol", "note": "search 必须是对象"}
     if pagination is not None and not isinstance(pagination, dict):
         return {}, {"source_status": "invalid_query_protocol", "note": "pagination 必须是对象"}
+    if validation is not None and not isinstance(validation, dict):
+        return {}, {"source_status": "invalid_query_protocol", "note": "validation 必须是对象"}
     if not isinstance(response, dict):
         return {}, {"source_status": "invalid_query_protocol", "note": "response 必须是对象"}
     if not isinstance(dependencies, list):
@@ -45,6 +48,7 @@ def _capabilities(select: dict) -> tuple[dict, dict | None]:
     ]
     caps = {
         "search_supported": bool(search),
+        "validation_supported": bool(validation),
         "depends_on": list(dict.fromkeys(depends_on)),
         "pagination_mode": mode,
     }
