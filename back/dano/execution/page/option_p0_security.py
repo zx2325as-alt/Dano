@@ -7,11 +7,11 @@ module enforces the narrow read contract expected from an option source:
 * only HTTP(S) absolute URLs are accepted;
 * credentials embedded in a URL are rejected;
 * credentials embedded in a recorded request body are rejected;
-* when a target-system base URL is known, the option source must be same-origin.
+* the option source must stay on the target system origin whenever that origin is known.
 
-Relative URLs remain compatible when the legacy caller has not supplied ``base_url``;
-they cannot redirect credentials to another origin by themselves and the underlying
-runtime preserves its previous resolution/error behavior.
+Newly compiled Skills bind each option source to the origin of the request that owns it.
+Legacy relative URLs remain compatible when neither runtime nor compiled origin exists;
+they cannot redirect credentials to another origin by themselves.
 """
 from __future__ import annotations
 
@@ -29,6 +29,10 @@ def _origin(url: str) -> tuple[str, str, int | None] | None:
     if port is None:
         port = 443 if parsed.scheme == "https" else 80
     return parsed.scheme.lower(), parsed.hostname.lower(), port
+
+
+def _effective_base_url(select: dict, base_url: str) -> str:
+    return str(base_url or select.get("source_target_origin") or "").strip()
 
 
 def _validate_source_request(select: dict, base_url: str) -> dict | None:
@@ -79,7 +83,7 @@ def _validate_source_request(select: dict, base_url: str) -> dict | None:
             "message": "候选来源只允许 HTTP 或 HTTPS",
         }
 
-    base = str(base_url or "").strip()
+    base = _effective_base_url(select, base_url)
     if not parsed_raw.scheme and not base:
         # Legacy execute paths may resolve this later from their own request context.
         # A relative URL is not cross-origin by itself, so do not reject it here.
@@ -137,12 +141,13 @@ def install_option_p0_security() -> None:
         verify: bool,
         auth_headers: dict | None,
     ):
-        violation = _validate_source_request(select, base_url)
+        effective_base_url = _effective_base_url(select, base_url)
+        violation = _validate_source_request(select, effective_base_url)
         if violation is not None:
             return None, violation
         return await original(
             select,
-            base_url=base_url,
+            base_url=effective_base_url,
             storage_state=storage_state,
             token_key=token_key,
             verify=verify,
