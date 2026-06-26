@@ -50,6 +50,7 @@ class OptionReferenceRecord:
 
 class OptionReferenceStore(Protocol):
     async def issue(self, record: OptionReferenceRecord) -> str: ...
+    async def issue_many(self, records: list[OptionReferenceRecord]) -> list[str]: ...
     async def redeem(self, token: str) -> OptionReferenceRecord: ...
 
 
@@ -83,6 +84,20 @@ def _decode_json(value: Any) -> Any:
     return value
 
 
+def _insert_args(token: str, record: OptionReferenceRecord) -> tuple:
+    return (
+        token_hash(token),
+        record.tenant,
+        record.skill_id,
+        record.field,
+        record.source_fingerprint,
+        json.dumps(record.value, ensure_ascii=False, separators=(",", ":"), default=str),
+        record.label,
+        record.context_hash,
+        record.expires_at,
+    )
+
+
 class MemoryOptionReferenceStore:
     """Deterministic injectable store for tests and single-process local development."""
 
@@ -91,66 +106,80 @@ class MemoryOptionReferenceStore:
         self._records: dict[str, OptionReferenceRecord] = {}
 
     async def issue(self, record: OptionReferenceRecord) -> str:
-        token = new_reference_token()
-        self._records[token_hash(token)] = copy.deepcopy(record)
-        return token
+        return (await self.issue_many([record]))[0]
+
+    async def issue_many(self, records: list[OptionReferenceRecord]) -> list[str]:
+        now = self._clock()
+        for digest, record in list(self._records.items()):
+            if record.expires_at <= now:
+                self._records.pop(digest, None)
+        tokens: list[str] = []
+        for record in records:
+            token = new_reference_token()
+            while token_hash(token) in self._records:
+                token = new_reference_token()
+            self._records[token_hash(token)] = copy.deepcopy(record)
+            tokens.append(token)
+        return tokens
 
     async def redeem(self, token: str) -> OptionReferenceRecord:
         if not looks_like_reference(token):
             raise OptionReferenceError("候选引用格式无效")
-        record = self._records.get(token_hash(token))
+        digest = token_hash(token)
+        record = self._records.get(digest)
         if record is None:
             raise OptionReferenceError("候选引用不存在或已失效")
         if record.expires_at <= self._clock():
-            self._records.pop(token_hash(token), None)
+            self._records.pop(digest, None)
             raise OptionReferenceExpired("候选引用已过期，请重新查询候选项")
         return copy.deepcopy(record)
 
 
 class PgOptionReferenceStore:
-    async def issue(self, record: OptionReferenceRecord) -> str:
+    _INSERT = (
+        "INSERT INTO option_references "
+        "(ref_hash, tenant, skill_id, field_name, source_fingerprint, value_json, label, context_hash, expires_at) "
+        "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,to_timestamp($9))"
+    )
+
+    @staticmethod
+    def _pool():
         try:
             from dano.infra.db import get_pool
 
-            pool = get_pool()
+            return get_pool()
         except Exception as exc:  # noqa: BLE001
             raise OptionReferenceUnavailable("候选引用存储不可用，已阻止返回原始系统 ID") from exc
-        token = new_reference_token()
-        digest = token_hash(token)
+
+    async def issue(self, record: OptionReferenceRecord) -> str:
+        return (await self.issue_many([record]))[0]
+
+    async def issue_many(self, records: list[OptionReferenceRecord]) -> list[str]:
+        if not records:
+            return []
+        pool = self._pool()
+        tokens = [new_reference_token() for _ in records]
+        args = [_insert_args(token, record) for token, record in zip(tokens, records)]
         try:
-            await pool.execute(
-                "INSERT INTO option_references "
-                "(ref_hash, tenant, skill_id, field_name, source_fingerprint, value_json, label, context_hash, expires_at) "
-                "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,to_timestamp($9))",
-                digest,
-                record.tenant,
-                record.skill_id,
-                record.field,
-                record.source_fingerprint,
-                json.dumps(record.value, ensure_ascii=False, separators=(",", ":"), default=str),
-                record.label,
-                record.context_hash,
-                record.expires_at,
-            )
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("DELETE FROM option_references WHERE expires_at <= now()")
+                    await conn.executemany(self._INSERT, args)
         except Exception as exc:  # noqa: BLE001
-            raise OptionReferenceUnavailable("候选引用写入失败，已阻止返回原始系统 ID") from exc
-        return token
+            raise OptionReferenceUnavailable("候选引用批量写入失败，已阻止返回原始系统 ID") from exc
+        return tokens
 
     async def redeem(self, token: str) -> OptionReferenceRecord:
         if not looks_like_reference(token):
             raise OptionReferenceError("候选引用格式无效")
-        try:
-            from dano.infra.db import get_pool
-
-            pool = get_pool()
-        except Exception as exc:  # noqa: BLE001
-            raise OptionReferenceUnavailable("候选引用存储不可用") from exc
+        pool = self._pool()
+        digest = token_hash(token)
         try:
             row = await pool.fetchrow(
                 "SELECT tenant, skill_id, field_name, source_fingerprint, value_json, label, context_hash, "
                 "extract(epoch from expires_at) AS expires_at "
                 "FROM option_references WHERE ref_hash=$1",
-                token_hash(token),
+                digest,
             )
         except Exception as exc:  # noqa: BLE001
             raise OptionReferenceUnavailable("候选引用读取失败") from exc
@@ -159,7 +188,7 @@ class PgOptionReferenceStore:
         expires_at = float(row["expires_at"])
         if expires_at <= time.time():
             try:
-                await pool.execute("DELETE FROM option_references WHERE ref_hash=$1", token_hash(token))
+                await pool.execute("DELETE FROM option_references WHERE ref_hash=$1", digest)
             except Exception:  # noqa: BLE001
                 pass
             raise OptionReferenceExpired("候选引用已过期，请重新查询候选项")
