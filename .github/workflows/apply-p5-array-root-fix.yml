@@ -1,0 +1,33 @@
+name: Apply P5 Array Root Fix
+
+on:
+  push:
+    branches:
+      - "feat/transaction-ir-compiler-p5"
+    paths:
+      - "scripts/fix_p5_array_root.py"
+      - ".github/workflows/apply-p5-array-root-fix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/transaction-ir-compiler-p5
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/fix_p5_array_root.py
+      - run: rm scripts/fix_p5_array_root.py .github/workflows/apply-p5-array-root-fix.yml
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(ir): compile array-root inputs from canonical token paths"
+          git push origin HEAD:feat/transaction-ir-compiler-p5
