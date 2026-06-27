@@ -710,8 +710,9 @@ async def record_ws(ws: WebSocket) -> None:
                     from dano.execution.page.trace_normalizer import normalize_capture_bundle
                     bundle = build_capture_bundle(
                         start_url=init.get("start_url") or "", steps=raw or [s.model_dump() for s in steps],
-                        writes=all_caps, reads=pending_reads, storage_state=login_state,
-                        samples=pending_samples, required_labels=pending_required)
+                        writes=all_caps, reads=pending_reads, timeline=sess.captured_timeline(),
+                        storage_state=login_state, samples=pending_samples,
+                        required_labels=pending_required)
                     pending_trace = normalize_capture_bundle(bundle)
                     chosen = pick_submit_request(cands, samples) or cands[-1]
                     pending_req = chosen
