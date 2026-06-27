@@ -1,13 +1,8 @@
-"""Publish-time authority seal for request-captured transaction assets.
+"""Publish-time authority for request-captured transaction assets.
 
-Inference and repair may operate on an unsealed draft. Immediately before publication the
-final executable request is deterministically bound to its Transaction IR. The seal covers
-both the private IR semantics and the complete executable artifact (excluding only derived
-public projections). Any post-seal mutation invalidates the asset and is rejected by
-self-check and the lowest-level publish gate.
-
-This is the migration boundary before a fully direct IR compiler: legacy builders may
-still bootstrap a draft, but the published artifact is immutable and hash-bound to the IR.
+Repair operates on an unsealed draft. Before publication the final executable request is
+bound to Transaction IR by stable hashes. The final sealed draft is the only P3 draft
+allowed to perform a live replay, and every call to the page publisher rechecks the seal.
 """
 from __future__ import annotations
 
@@ -15,11 +10,13 @@ import copy
 import hashlib
 import json
 from typing import Any, Callable
+from uuid import UUID
 
 AUTHORITY_VERSION = "transaction-authority/v1"
 COMPILER_VERSION = "ir-compiler/p4"
 _INSTALLED = False
 _DERIVED_TOP_LEVEL = {"skill_interface"}
+_REPLAY_PLANS: dict[str, dict] = {}
 
 
 def _stable_json(value: Any) -> str:
@@ -84,8 +81,6 @@ def seal_api_request(api_request: dict) -> dict:
     sealed = copy.deepcopy(artifact)
     sealed["transaction_ir"] = sealed_ir
 
-    # Public interface is derived after sealing and intentionally excluded from the seal;
-    # it can always be regenerated without changing executable semantics.
     from dano.execution.page.skill_interface import build_skill_interface
 
     sealed["skill_interface"] = build_skill_interface(sealed)
@@ -122,11 +117,7 @@ def verify_transaction_authority(api_request: dict | None) -> bool:
 
 
 def publish_authority_issues(asset_type: Any, body: dict | None) -> list[str]:
-    """Return hard-gate violations for a draft about to be published.
-
-    Legacy and non-page assets remain compatible. A P3 page asset is publishable only when
-    its full server-owned api_request carries a valid P4 seal.
-    """
+    """Return hard-gate violations for a draft about to be published."""
     value = getattr(asset_type, "value", asset_type)
     if str(value) != "page_script" or not isinstance(body, dict):
         return []
@@ -141,13 +132,76 @@ def _wrap_self_check(original: Callable):
         issues = list(original(api_request, *args, **kwargs) or [])
         transaction_ir = (api_request or {}).get("transaction_ir") or {}
         authority = transaction_ir.get("authority") if isinstance(transaction_ir, dict) else None
-        # Drafts are intentionally unsealed while repair is still allowed. Once a seal is
-        # present it is immutable and every deterministic replay verifies it.
         if isinstance(authority, dict) and authority.get("enforce"):
             for issue in authority_issues(api_request):
                 if issue not in issues:
                     issues.append(issue)
         return issues
+
+    return wrapped
+
+
+def _sealed(api_request: dict | None) -> bool:
+    authority = ((api_request or {}).get("transaction_ir") or {}).get("authority")
+    return bool(isinstance(authority, dict) and authority.get("enforce"))
+
+
+def _wrap_sandbox_replay(original: Callable, tools_module):  # noqa: ANN001
+    async def wrapped(run_id: str, params: dict):
+        draft = None
+        try:
+            draft = await tools_module._ds.get_draft(UUID(params["asset_draft_id"]))
+        except Exception:  # noqa: BLE001
+            return await original(run_id, params)
+        api_request = ((draft.body or {}).get("api_request") if draft is not None else None)
+        if not authority_required(api_request):
+            return await original(run_id, params)
+
+        call_params = copy.deepcopy(params)
+        if not _sealed(api_request):
+            # Remember the requested live plan on the first pre-seal validation, but keep
+            # every editable/unreviewed draft dry. Repair rounds cannot overwrite it.
+            if run_id not in _REPLAY_PLANS and ("live" in params or "storage_state" in params):
+                _REPLAY_PLANS[run_id] = {
+                    "live": bool(params.get("live")),
+                    "storage_state": copy.deepcopy(params.get("storage_state")),
+                    "verify": bool(params.get("verify", False)),
+                }
+            call_params["live"] = False
+            call_params["verify"] = False
+            return await original(run_id, call_params)
+
+        # The final sealed draft consumes the remembered plan. In a reversible sandbox it
+        # performs the one live write and fact-check; otherwise it remains an honest dry run.
+        plan = _REPLAY_PLANS.pop(run_id, None)
+        if plan is not None:
+            call_params["live"] = bool(plan.get("live"))
+            call_params["storage_state"] = copy.deepcopy(plan.get("storage_state"))
+            call_params["verify"] = bool(plan.get("verify", False))
+        return await original(run_id, call_params)
+
+    return wrapped
+
+
+def _wrap_publish_asset(original: Callable, tools_module):  # noqa: ANN001
+    async def wrapped(run_id: str, params: dict):
+        try:
+            draft = await tools_module._ds.get_draft(UUID(params["asset_draft_id"]))
+        except Exception:  # noqa: BLE001
+            draft = None
+        if draft is not None:
+            issues = publish_authority_issues(draft.asset_type, draft.body)
+            if issues:
+                tools_module.log.warning(
+                    "publish_asset.authority_rejected",
+                    draft=str(draft.asset_draft_id),
+                    issues=issues,
+                )
+                return {
+                    "published": False,
+                    "reason": "Transaction Authority 发布硬闸门未通过: " + "; ".join(issues),
+                }
+        return await original(run_id, params)
 
     return wrapped
 
@@ -159,7 +213,19 @@ def install_transaction_authority_p4() -> None:
     from dano.execution.page import request_capture as rc
 
     if not getattr(rc.self_check, "__dano_transaction_authority_p4__", False):
-        wrapped = _wrap_self_check(rc.self_check)
-        wrapped.__dano_transaction_authority_p4__ = True
-        rc.self_check = wrapped
+        wrapped_check = _wrap_self_check(rc.self_check)
+        wrapped_check.__dano_transaction_authority_p4__ = True
+        rc.self_check = wrapped_check
+
+    from dano.agent_tools import tools as tools_module
+
+    if not getattr(tools_module.sandbox_replay, "__dano_transaction_authority_p4__", False):
+        wrapped_replay = _wrap_sandbox_replay(tools_module.sandbox_replay, tools_module)
+        wrapped_replay.__dano_transaction_authority_p4__ = True
+        tools_module.sandbox_replay = wrapped_replay
+    if not getattr(tools_module.publish_asset, "__dano_transaction_authority_p4__", False):
+        wrapped_publish = _wrap_publish_asset(tools_module.publish_asset, tools_module)
+        wrapped_publish.__dano_transaction_authority_p4__ = True
+        tools_module.publish_asset = wrapped_publish
+
     _INSTALLED = True
