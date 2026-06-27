@@ -1,18 +1,18 @@
 """Transaction-level IR for request-captured page skills.
 
-The IR is the stable capture model. It describes user-facing inputs, option sources,
-bindings into the target request body, identity values and constants before it is
-compiled back to the legacy ``api_request`` shape.
+Transaction IR is the business and execution source of truth. It owns public inputs,
+option sources, request bindings, identities, constants, derived fields, workflow links,
+assertions and the captured request skeleton. ``api_request`` is a deterministic projection
+and must be reproducible from this document.
 """
-
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import hashlib
 from typing import Any
 
-
 IR_VERSION = "transaction-ir/v1"
+P5_COMPILER = "transaction-ir/p5"
 
 
 def stable_source_id(url: str | None, value_key: str | None = "", label_key: str | None = "") -> str:
@@ -28,6 +28,10 @@ class SourceSpec:
     value_key: str = ""
     label_key: str = ""
     method: str = "GET"
+    content_type: str = "application/json"
+    post_data: Any = None
+    query: dict = field(default_factory=dict)
+    headers: dict = field(default_factory=dict)
     records_path: list[str | int] = field(default_factory=list)
     query_protocol: dict = field(default_factory=dict)
     inference: dict = field(default_factory=dict)
@@ -41,6 +45,7 @@ class SourceSpec:
 class InputSpec:
     name: str
     path: str
+    tokens: list[str | int] = field(default_factory=list)
     type: str = "string"
     required: bool = True
     sample: Any = None
@@ -55,16 +60,21 @@ class InputSpec:
 class BindingSpec:
     input: str
     target_path: str
+    target_tokens: list[str | int] = field(default_factory=list)
     mode: str = "direct"
     source_id: str | None = None
     target_key: str | None = None
+    paired_id_path: str | None = None
+    paired_id_tokens: list[str | int] = field(default_factory=list)
     item_template: dict | None = None
     expand_fields: list[str] = field(default_factory=list)
+    derived_count_paths: list[dict] = field(default_factory=list)
 
 
 @dataclass
 class ConstantSpec:
     path: str
+    tokens: list[str | int] = field(default_factory=list)
     value: Any = None
     reason: str = "captured_constant"
 
@@ -72,6 +82,7 @@ class ConstantSpec:
 @dataclass
 class IdentitySpec:
     path: str
+    tokens: list[str | int] = field(default_factory=list)
     source: str = ""
     evidence: list[str] = field(default_factory=list)
 
@@ -97,7 +108,11 @@ class TransactionIR:
     identity: list[IdentitySpec] = field(default_factory=list)
     derived: list[dict] = field(default_factory=list)
     steps: list[StepSpec] = field(default_factory=list)
+    execution: dict = field(default_factory=dict)
     success: dict = field(default_factory=dict)
+    fact_check: dict = field(default_factory=dict)
+    goal: dict = field(default_factory=dict)
+    compile: dict = field(default_factory=dict)
     capture: dict = field(default_factory=dict)
 
 
@@ -106,8 +121,7 @@ def _strip_empty(value: Any) -> Any:
         out = {}
         for k, v in value.items():
             vv = _strip_empty(v)
-            # ``records_path=[]`` is not empty metadata: it explicitly means that the
-            # response root itself is the candidate array. Preserve that distinction.
+            # records_path=[] explicitly means response root list.
             if vv in (None, "", [], {}) and not (k == "records_path" and v == []):
                 continue
             out[k] = vv
@@ -130,8 +144,8 @@ def request_path(url: str | None) -> str:
     return u or "/"
 
 
-def _valid_tokens(path: Any) -> bool:
-    if not isinstance(path, list) or not path:
+def _valid_tokens(path: Any, *, empty: bool = False) -> bool:
+    if not isinstance(path, list) or (not path and not empty):
         return False
     return all(
         not isinstance(token, bool)
@@ -143,13 +157,7 @@ def _valid_tokens(path: Any) -> bool:
 
 
 def _valid_records_path(path: Any) -> bool:
-    return isinstance(path, list) and all(
-        not isinstance(token, bool)
-        and isinstance(token, (str, int))
-        and (not isinstance(token, int) or token >= 0)
-        and (not isinstance(token, str) or bool(token))
-        for token in path
-    )
+    return _valid_tokens(path, empty=True)
 
 
 def _validate_query_protocol(protocol: Any, prefix: str) -> list[str]:
@@ -191,12 +199,13 @@ def _validate_query_protocol(protocol: Any, prefix: str) -> list[str]:
 
 
 def validate_transaction_ir(ir: dict | None) -> list[str]:
-    """Validate the IR graph before trusting it as publish-time provenance."""
+    """Validate graph integrity before compilation, sealing or publication."""
     if not isinstance(ir, dict):
         return ["ir must be an object"]
     issues: list[str] = []
     if ir.get("version") != IR_VERSION:
         issues.append("version must be transaction-ir/v1")
+
     input_names: set[str] = set()
     for i, inp in enumerate(ir.get("inputs") or []):
         name = str((inp or {}).get("name") or "")
@@ -208,6 +217,9 @@ def validate_transaction_ir(ir: dict | None) -> list[str]:
         input_names.add(name)
         if not path:
             issues.append(f"inputs[{i}].path is required")
+        if "tokens" in (inp or {}) and not _valid_tokens((inp or {}).get("tokens")):
+            issues.append(f"inputs[{i}].tokens must be a non-empty token path")
+
     source_ids: set[str] = set()
     for i, src in enumerate(ir.get("sources") or []):
         sid = str((src or {}).get("id") or "")
@@ -232,6 +244,7 @@ def validate_transaction_ir(ir: dict | None) -> list[str]:
                 confidence = inference.get("confidence")
                 if confidence is not None and not (isinstance(confidence, (int, float)) and 0 <= confidence <= 1):
                     issues.append(f"sources[{i}].inference.confidence must be between 0 and 1")
+
     for i, binding in enumerate(ir.get("bindings") or []):
         name = str((binding or {}).get("input") or "")
         if name and input_names and name not in input_names:
@@ -241,7 +254,38 @@ def validate_transaction_ir(ir: dict | None) -> list[str]:
             issues.append(f"bindings[{i}].source_id references unknown source {sid}")
         if not (binding or {}).get("target_path"):
             issues.append(f"bindings[{i}].target_path is required")
+        if "target_tokens" in (binding or {}) and not _valid_tokens((binding or {}).get("target_tokens")):
+            issues.append(f"bindings[{i}].target_tokens must be a non-empty token path")
+
+    for i, identity in enumerate(ir.get("identity") or []):
+        if not (identity or {}).get("path"):
+            issues.append(f"identity[{i}].path is required")
+        if "tokens" in (identity or {}) and not _valid_tokens((identity or {}).get("tokens")):
+            issues.append(f"identity[{i}].tokens must be a non-empty token path")
+
     for i, item in enumerate(ir.get("derived") or []):
         if item.get("kind") in {"array_count", "mirror"} and not item.get("target_path"):
             issues.append(f"derived[{i}].target_path is required")
+
+    compile_meta = ir.get("compile") or {}
+    if compile_meta.get("compiler") == P5_COMPILER:
+        execution = ir.get("execution")
+        if not isinstance(execution, dict):
+            issues.append("execution must be an object for transaction-ir/p5")
+        else:
+            kind = execution.get("kind")
+            requests = execution.get("requests")
+            if kind not in {"single", "workflow"}:
+                issues.append("execution.kind must be single or workflow")
+            if not isinstance(requests, list) or not requests:
+                issues.append("execution.requests must be a non-empty array")
+            else:
+                for i, request in enumerate(requests):
+                    if not isinstance(request, dict):
+                        issues.append(f"execution.requests[{i}] must be an object")
+                        continue
+                    if not request.get("url") and not request.get("path"):
+                        issues.append(f"execution.requests[{i}].url/path is required")
+                    if not isinstance(request.get("body"), (dict, list)):
+                        issues.append(f"execution.requests[{i}].body must be an object or array")
     return issues
