@@ -1,0 +1,371 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+# Importing the package installs the additive P0 compatibility layer.
+import dano.execution.page  # noqa: F401
+from dano.execution.page import request_capture as rc
+
+
+def test_suggest_selects_preserves_safe_recorded_source_request() -> None:
+    submit = '{"approverId":12}'
+    reads = [{
+        "method": "POST",
+        "url": "https://oa.example/api/user/search",
+        "post_data": '{"deptId":7,"keyword":""}',
+        "content_type": "application/json",
+        "source_headers": {"X-Tenant-Id": "7"},
+        "records_path": ["rows"],
+        "json": {"rows": [{"userId": 12, "nickName": "张经理"}]},
+    }]
+
+    out = rc.suggest_selects(submit, reads)
+
+    assert len(out) == 1
+    assert out[0]["source_method"] == "POST"
+    assert json.loads(out[0]["source_post_data"]) == {"deptId": 7, "keyword": ""}
+    assert out[0]["source_content_type"] == "application/json"
+    assert out[0]["source_headers"] == {"X-Tenant-Id": "7"}
+    assert out[0]["source_records_path"] == ["rows"]
+
+
+def test_build_api_request_keeps_option_source_request_metadata() -> None:
+    req = {
+        "method": "POST",
+        "url": "https://oa.example/api/leave/submit",
+        "post_data": '{"approverId":12}',
+        "content_type": "application/json",
+        "headers": {"Authorization": "Bearer current"},
+    }
+    select = {
+        "path": "approverId",
+        "tokens": ["approverId"],
+        "source_url": "https://oa.example/api/user/search",
+        "source_method": "POST",
+        "source_post_data": '{"deptId":7}',
+        "source_content_type": "application/json",
+        "source_headers": {"X-Tenant-Id": "7"},
+        "source_records_path": ["rows"],
+        "value_key": "userId",
+        "label_key": "nickName",
+    }
+
+    compiled = rc.build_api_request(req, {"approverId": "审批人"}, selects=[select])
+
+    assert compiled is not None
+    compiled_select = compiled["selects"][0]
+    assert compiled_select["source_method"] == "POST"
+    assert compiled_select["source_post_data"] == '{"deptId":7}'
+    assert compiled_select["source_headers"] == {"X-Tenant-Id": "7"}
+    assert compiled_select["source_records_path"] == ["rows"]
+
+
+def test_small_primitive_string_enum_is_recognized_with_ui_evidence() -> None:
+    submit = '{"priority":"HIGH"}'
+    reads = [{
+        "method": "GET",
+        "url": "https://oa.example/api/priorities",
+        "records_path": [],
+        "json": ["LOW", "NORMAL", "HIGH"],
+    }]
+
+    out = rc.suggest_selects(submit, reads, {"优先级": "HIGH"})
+
+    assert len(out) == 1
+    assert out[0]["primitive"] is True
+    assert out[0]["path"] == "priority"
+    assert out[0]["source_records_path"] == []
+    assert out[0]["options"][-1] == {"label": "HIGH", "value": "HIGH"}
+
+
+def test_ambiguous_primitive_sources_are_not_auto_bound() -> None:
+    submit = '{"priority":"HIGH"}'
+    reads = [
+        {"method": "GET", "url": "/a", "json": ["LOW", "HIGH"]},
+        {"method": "GET", "url": "/b", "json": ["LOW", "HIGH"]},
+    ]
+
+    out = rc.suggest_selects(submit, reads, {"优先级": "HIGH"})
+
+    assert out == []
+
+
+class _Response:
+    def __init__(self, status_code: int, data) -> None:
+        self.status_code = status_code
+        self._data = data
+        self.text = json.dumps(data, ensure_ascii=False)
+
+    def json(self):
+        return self._data
+
+
+class _Client:
+    calls: list[dict] = []
+    response = _Response(200, {"rows": [{"id": 1, "name": "会议室A"}]})
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def request(self, method, url, headers=None, **kwargs):
+        type(self).calls.append({"method": method, "url": url, "headers": headers, **kwargs})
+        return type(self).response
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_replays_post_json_and_current_auth(monkeypatch) -> None:
+    import httpx
+
+    _Client.calls = []
+    _Client.response = _Response(200, {"rows": [{"id": 1, "name": "会议室A"}]})
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "auth_headers": {"Authorization": "Bearer current"},
+        "selects": [{
+            "param": "会议室",
+            "source_url": "/api/room/search",
+            "source_method": "POST",
+            "source_post_data": '{"date":"2026-06-26"}',
+            "source_content_type": "application/json",
+            "source_headers": {"X-Tenant-Id": "7"},
+            "source_records_path": ["rows"],
+            "value_key": "id",
+            "label_key": "name",
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "会议室", base_url="https://oa.example")
+
+    assert out["source_status"] == "ok"
+    assert out["options"] == [{"label": "会议室A", "value": "1"}]
+    assert _Client.calls[0]["method"] == "POST"
+    assert _Client.calls[0]["json"] == {"date": "2026-06-26"}
+    assert _Client.calls[0]["headers"]["Authorization"] == "Bearer current"
+    assert _Client.calls[0]["headers"]["X-Tenant-Id"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_supports_root_primitive_list(monkeypatch) -> None:
+    import httpx
+
+    _Client.calls = []
+    _Client.response = _Response(200, ["LOW", "NORMAL", "HIGH"])
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "优先级",
+            "source_url": "/api/priorities",
+            "source_records_path": [],
+            "primitive": True,
+            "value_key": None,
+            "label_key": None,
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "优先级", base_url="https://oa.example")
+
+    assert out["source_status"] == "ok"
+    assert out["options"] == [
+        {"label": "LOW", "value": "LOW"},
+        {"label": "NORMAL", "value": "NORMAL"},
+        {"label": "HIGH", "value": "HIGH"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_primitive_enum_validates_live_candidates(monkeypatch) -> None:
+    import httpx
+
+    _Client.response = _Response(200, ["LOW", "NORMAL", "HIGH"])
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "优先级",
+            "source_url": "/api/priorities",
+            "source_records_path": [],
+            "primitive": True,
+            "value_key": None,
+            "label_key": None,
+        }]
+    }
+
+    fields, overrides = await rc._resolve_selects(
+        api_request,
+        {"优先级": "HIGH"},
+        base_url="https://oa.example",
+        storage_state=None,
+        token_key=None,
+        verify=True,
+    )
+
+    assert fields["优先级"] == "HIGH"
+    assert overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_treats_recorded_empty_list_as_valid(monkeypatch) -> None:
+    import httpx
+
+    _Client.calls = []
+    _Client.response = _Response(200, {"data": {"records": []}})
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "会议室",
+            "source_url": "/api/room/search",
+            "source_records_path": ["data", "records"],
+            "value_key": "id",
+            "label_key": "name",
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "会议室", base_url="https://oa.example")
+
+    assert out["options"] == []
+    assert out["source_status"] == "empty"
+    assert out["note"] == "当前条件下没有可选项"
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_reports_response_shape_drift(monkeypatch) -> None:
+    import httpx
+
+    _Client.response = _Response(200, {"data": {"itemsAfterUpgrade": []}})
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "会议室",
+            "source_url": "/api/room/search",
+            "source_records_path": ["data", "records"],
+            "value_key": "id",
+            "label_key": "name",
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "会议室", base_url="https://oa.example")
+
+    assert out["options"] == []
+    assert out["source_status"] == "invalid_shape"
+    assert "结构" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_field_options_reports_auth_expired_without_snapshot_fallback(monkeypatch) -> None:
+    import httpx
+
+    _Client.calls = []
+    _Client.response = _Response(401, {"message": "expired"})
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "selects": [{
+            "param": "审批人",
+            "source_url": "/api/user/search",
+            "source_method": "POST",
+            "source_post_data": "{}",
+            "source_content_type": "application/json",
+            "source_records_path": ["rows"],
+            "value_key": "id",
+            "label_key": "name",
+        }]
+    }
+
+    out = await rc.fetch_field_options(api_request, "审批人", base_url="https://oa.example")
+
+    assert out["options"] == []
+    assert out["source_status"] == "auth_expired"
+    assert out["http_status"] == 401
+    assert "登录态" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_execute_select_fails_closed_when_source_unavailable(monkeypatch) -> None:
+    import httpx
+
+    _Client.response = _Response(403, {"message": "forbidden"})
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    api_request = {
+        "method": "POST",
+        "url": "https://oa.example/api/submit",
+        "body_template": {"approverId": "{{审批人}}"},
+        "params": ["审批人"],
+        "selects": [{
+            "param": "审批人",
+            "source_url": "/api/user/search",
+            "source_method": "POST",
+            "source_post_data": "{}",
+            "source_content_type": "application/json",
+            "source_records_path": ["rows"],
+            "value_key": "id",
+            "label_key": "name",
+        }],
+    }
+
+    out = await rc.execute_api_request(api_request, {"审批人": 12}, send=True)
+
+    assert out["ok"] is False
+    assert "没有读取候选项的权限" in out["detail"]
+
+
+class _RecordedRequest:
+    method = "POST"
+    post_data = '{"deptId":7}'
+    headers = {
+        "content-type": "application/json",
+        "authorization": "Bearer source-token",
+        "x-api-token": "secret",
+        "x-tenant-id": "7",
+        "user-agent": "browser-noise",
+    }
+
+
+class _RecordedResponse:
+    request = _RecordedRequest()
+    url = "https://oa.example/api/user/search"
+    status = 200
+    headers = {"content-type": "application/json"}
+
+    async def json(self):
+        return {"rows": [{"userId": 12, "nickName": "张经理"}]}
+
+
+class _RecordedEmptyResponse(_RecordedResponse):
+    async def json(self):
+        return {"data": {"records": []}}
+
+
+@pytest.mark.asyncio
+async def test_recorder_captures_source_request_without_credentials() -> None:
+    from dano.execution.page.recorder import RecordSession
+
+    session = RecordSession()
+    await session._on_response(_RecordedResponse())
+
+    assert len(session.reads) == 1
+    read = session.reads[0]
+    assert read["method"] == "POST"
+    assert read["post_data"] == '{"deptId":7}'
+    assert read["content_type"] == "application/json"
+    assert read["source_headers"] == {"x-tenant-id": "7"}
+    assert read["records_path"] == ["rows"]
+
+
+@pytest.mark.asyncio
+async def test_recorder_keeps_legitimate_empty_option_response() -> None:
+    from dano.execution.page.recorder import RecordSession
+
+    session = RecordSession()
+    await session._on_response(_RecordedEmptyResponse())
+
+    assert len(session.reads) == 1
+    read = session.reads[0]
+    assert read["count"] == 0
+    assert read["records_path"] == ["data", "records"]
+    assert read["source_headers"] == {"x-tenant-id": "7"}

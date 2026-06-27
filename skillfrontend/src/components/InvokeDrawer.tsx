@@ -12,6 +12,15 @@ const STATE_COLOR: Record<string, string> = {
   cancelled: "warning", needs_input: "warning", needs_select: "warning",
 };
 
+const OPTION_READY = new Set(["ok", "empty"]);
+const OPTION_NON_ERROR = new Set(["idle", "loading", "ok", "empty"]);
+
+type OptionLoadState = {
+  status: string;
+  message?: string;
+  httpStatus?: number;
+};
+
 // 候选项标识:优先 id,否则第一个值(与后端 _candidate_id 一致)
 function candidateId(c: Record<string, unknown>): unknown {
   return c.id ?? Object.values(c)[0];
@@ -35,9 +44,10 @@ function normalizeOptions(p: JSONSchemaProperty): ToolOption[] {
   for (const item of raw) {
     const rec = item as Record<string, unknown>;
     const label = typeof item === "object" && item !== null && "label" in rec ? String(rec.label ?? "") : String(item ?? "");
-    const value = typeof item === "object" && item !== null && "value" in rec ? String(rec.value ?? "") : String(item ?? "");
+    const rawValue = typeof item === "object" && item !== null && "value" in rec ? rec.value : item;
+    const value = typeof rawValue === "number" ? rawValue : String(rawValue ?? "");
     if (!label) continue;
-    const key = `${label}\u0000${value}`;
+    const key = `${label}\u0000${String(value)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({ label, value });
@@ -51,6 +61,10 @@ function jsonSkeleton(p: JSONSchema): string {
   return JSON.stringify(o, null, 2);
 }
 
+function isOptionSourceFailure(state?: OptionLoadState): boolean {
+  return !!state && !OPTION_NON_ERROR.has(state.status);
+}
+
 export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest | null; onClose: () => void }) {
   const [mode, setMode] = useState<"form" | "json">("form");
   const [values, setValues] = useState<Record<string, unknown>>({});
@@ -61,6 +75,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
   const [lastInput, setLastInput] = useState<Record<string, unknown>>({});  // 供消歧选中后带同一组输入重调
   const [optionCache, setOptionCache] = useState<Record<string, ToolOption[]>>({});
   const [optionLoading, setOptionLoading] = useState<Record<string, boolean>>({});
+  const [optionState, setOptionState] = useState<Record<string, OptionLoadState>>({});
 
   const props = useMemo(() => skill?.parameters?.properties || {}, [skill]);
   const required = useMemo(() => new Set(skill?.parameters?.required || []), [skill]);
@@ -74,26 +89,58 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
       setOut(null);
       setOptionCache({});
       setOptionLoading({});
+      setOptionState({});
     }
   }, [skill]);
 
   const setVal = (k: string, v: unknown) => setValues((p) => ({ ...p, [k]: v }));
 
-  async function loadOptions(key: string, p: JSONSchemaProperty) {
-    if (!skill || optionCache[key] || optionLoading[key]) return;
-    const fallback = normalizeOptions(p);
-    if (!p?.["x-options-source"]) {
-      setOptionCache((prev) => ({ ...prev, [key]: fallback }));
+  async function loadOptions(key: string, p: JSONSchemaProperty, force = false) {
+    if (!skill || optionLoading[key]) return;
+    const dynamic = !!p?.["x-options-source"];
+    if (!dynamic) {
+      if (!(key in optionCache)) setOptionCache((prev) => ({ ...prev, [key]: normalizeOptions(p) }));
       return;
     }
+    if (!force && OPTION_READY.has(optionState[key]?.status || "")) return;
+
     setOptionLoading((prev) => ({ ...prev, [key]: true }));
+    setOptionState((prev) => ({ ...prev, [key]: { status: "loading" } }));
     try {
       const res = await listSkillOptions(skill.name, key);
-      setOptionCache((prev) => ({ ...prev, [key]: (res.options || []).length ? res.options : fallback }));
-      if (res.note && !(res.options || []).length) message.warning(res.note);
+      const status = res.source_status || ((res.options || []).length ? "ok" : "empty");
+      if (OPTION_READY.has(status)) {
+        setOptionCache((prev) => ({ ...prev, [key]: res.options || [] }));
+        setOptionState((prev) => ({
+          ...prev,
+          [key]: { status, message: res.note, httpStatus: res.http_status },
+        }));
+        if (status === "empty" && res.note) message.info(res.note);
+      } else {
+        // 动态来源失败时不使用录制快照，也不保留之前选中的旧值。
+        setOptionCache((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        setVal(key, undefined);
+        const detail = res.note || `候选来源不可用（${status}）`;
+        setOptionState((prev) => ({
+          ...prev,
+          [key]: { status, message: detail, httpStatus: res.http_status },
+        }));
+        message.error(`${key}：${detail}`);
+      }
     } catch (e: any) {
-      setOptionCache((prev) => ({ ...prev, [key]: fallback }));
-      message.error(`拉取 ${key} 候选失败:` + (e?.response?.data?.detail || e.message));
+      setOptionCache((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      setVal(key, undefined);
+      const detail = e?.response?.data?.detail || e.message || "候选来源请求失败";
+      setOptionState((prev) => ({ ...prev, [key]: { status: "network_error", message: detail } }));
+      message.error(`拉取 ${key} 候选失败：${detail}`);
     } finally {
       setOptionLoading((prev) => ({ ...prev, [key]: false }));
     }
@@ -129,6 +176,15 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
         message.error("缺必填:" + missing.join(", "));
         return;
       }
+      const brokenSources = Object.keys(props).filter((k) => {
+        if (!props[k]?.["x-options-source"]) return false;
+        if (!required.has(k) && (values[k] === "" || values[k] == null)) return false;
+        return isOptionSourceFailure(optionState[k]);
+      });
+      if (brokenSources.length) {
+        message.error("以下动态候选来源不可用，不能提交：" + brokenSources.join(", "));
+        return;
+      }
       // 丢掉空的可选字段;数字/日期已是正确类型
       input = Object.fromEntries(Object.entries(values).filter(([, v]) => v !== "" && v != null));
     }
@@ -140,8 +196,12 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
     const hint = `${key} ${label}`;
     const reqMark = required.has(key) ? <span style={{ color: "#cf1322" }}> *</span> : null;
     let widget;
+    let sourceHint = null;
     if (isSelectProp(p)) {
-      const options = optionCache[key] || normalizeOptions(p);
+      const dynamic = !!p?.["x-options-source"];
+      const state = optionState[key];
+      const sourceFailed = dynamic && isOptionSourceFailure(state);
+      const options = dynamic ? (optionCache[key] || []) : normalizeOptions(p);
       const multi = isMultiSelectProp(p);
       widget = (
         <Select
@@ -153,12 +213,38 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           value={(values[key] as any) ?? undefined}
           options={options}
           loading={!!optionLoading[key]}
-          placeholder={key}
+          status={sourceFailed ? "error" : undefined}
+          placeholder={dynamic ? `打开下拉实时加载${label}` : key}
+          notFoundContent={
+            optionLoading[key] ? "正在加载候选…"
+              : sourceFailed ? "候选来源不可用"
+                : state?.status === "empty" ? "当前条件下没有可选项"
+                  : dynamic ? "打开下拉加载实时候选" : "无可选项"
+          }
           onFocus={() => loadOptions(key, p)}
           onDropdownVisibleChange={(open) => { if (open) loadOptions(key, p); }}
           onChange={(v) => setVal(key, v)}
         />
       );
+      if (sourceFailed) {
+        sourceHint = (
+          <Alert
+            style={{ marginTop: 6 }}
+            type="error"
+            showIcon
+            message={state?.message || "动态候选来源不可用"}
+            description={state?.httpStatus ? `HTTP ${state.httpStatus}` : undefined}
+            action={<Button size="small" onClick={() => loadOptions(key, p, true)}>重试</Button>}
+          />
+        );
+      } else if (dynamic && state?.status === "empty") {
+        sourceHint = (
+          <Space size={4} style={{ marginTop: 4 }}>
+            <Typography.Text type="secondary">{state.message || "当前条件下没有可选项"}</Typography.Text>
+            <Button type="link" size="small" onClick={() => loadOptions(key, p, true)}>重新加载</Button>
+          </Space>
+        );
+      }
     } else if (isDate(hint)) {
       widget = <DatePicker style={{ width: "100%" }} onChange={(_, ds) => setVal(key, ds)} />;
     } else if (isNum(hint)) {
@@ -174,6 +260,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           {label}{reqMark}{label !== key && <Typography.Text type="secondary" style={{ fontSize: 12 }}> · {key}</Typography.Text>}
         </div>
         {widget}
+        {sourceHint}
       </div>
     );
   };
