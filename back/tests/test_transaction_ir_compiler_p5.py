@@ -213,7 +213,7 @@ def test_invalid_ir_patch_rolls_back_without_changing_artifact() -> None:
     assert repaired == compiled
 
 
-def test_workflow_is_materialized_and_compiled_from_ir() -> None:
+def _compiled_workflow() -> dict:
     first = {
         "method": "POST",
         "url": "https://oa.example/api/leave/draft",
@@ -231,19 +231,48 @@ def test_workflow_is_materialized_and_compiled_from_ir() -> None:
     ir["bindings"] = [{"input": "原因", "target_path": "form.reason", "mode": "direct"}]
     ir["sources"] = []
     ir["identity"] = []
-
-    compiled = compile_api_workflow_from_ir(
+    return compile_api_workflow_from_ir(
         [first, second],
         param_map={"form.reason": "原因"},
         typed={"原因": "回家"},
         transaction_ir=ir,
     )
 
+
+def test_workflow_is_materialized_and_compiled_from_ir() -> None:
+    compiled = _compiled_workflow()
+
     assert is_ir_authoritative(compiled)
     assert compiled["transaction_ir"]["execution"]["kind"] == "workflow"
     assert len(compiled["steps"]) == 2
     assert compiled["steps"][-1]["body_template"]["form"]["reason"] == "{{原因}}"
     assert compiled["params"] == ["原因"]
+
+
+def test_constants_are_a_canonical_partition_not_a_second_owner() -> None:
+    compiled = compile_single()
+
+    constants = compiled["transaction_ir"]["constants"]
+
+    assert [(item["tokens"], item["value"]) for item in constants] == [
+        (["form", "flowKey"], "leave_flow")
+    ]
+    assert all(item["tokens"] not in (
+        ["form", "reason"], ["form", "approverId"], ["form", "applicantId"]
+    ) for item in constants)
+
+
+def test_failed_reorder_restores_the_ir_and_artifact() -> None:
+    compiled = _compiled_workflow()
+    assert compiled["transaction_ir"]["execution"]["links"]
+
+    repaired, applied, rejected = apply_ir_fix_ops(compiled, [
+        {"op": "reorder_steps", "order": [1, 0]},
+    ])
+
+    assert applied == []
+    assert rejected and "依赖倒置" in rejected[0]["detail"]
+    assert repaired == compiled
 
 
 @pytest.mark.asyncio
