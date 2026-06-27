@@ -262,16 +262,30 @@ def _materialize_ir(
         entry["evidence"] = evidence
         identity_items.append(entry)
 
-    constants: list[dict] = []
-    identity_locations = {(int(item.get("step", 0)), tuple(item.get("tokens") or [])) for item in identity_items}
-    binding_locations = {(int(item.get("step", 0)), tuple(item.get("target_tokens") or [])) for item in bindings}
-    for step, request in enumerate(request_specs):
-        for path, tokens, _shown, raw in _leaf_paths(request["body"]):
-            location = (step, tuple(tokens))
-            if location in binding_locations or location in identity_locations:
-                continue
-            constants.append({"path": path, "tokens": list(tokens), "step": step,
-                              "value": copy.deepcopy(raw), "reason": "captured_constant"})
+    # Top-level derived entries are reserved for scalar mirrors. Array counts are owned
+    # by the array binding's derived_count_paths and applied by the select resolver.
+    derived_items: list[dict] = []
+    for item in ir.get("derived") or []:
+        if not isinstance(item, dict) or item.get("kind") == "array_count":
+            continue
+        entry = copy.deepcopy(item)
+        target_path = str(entry.get("target_path") or "")
+        if not target_path:
+            continue
+        target_step, target_tokens, _target_raw = _tokens_for_path(
+            request_specs, target_path, preferred_step=entry.get("step")
+        )
+        entry["step"] = target_step
+        entry["target_tokens"] = list(entry.get("target_tokens") or target_tokens)
+        source_path = str(entry.get("source_path") or "")
+        if source_path:
+            source_step, source_tokens, _source_raw = _tokens_for_path(
+                request_specs, source_path, preferred_step=target_step
+            )
+            if source_step != target_step:
+                raise ValueError("derived mirror source and target must be in the same request")
+            entry["source_tokens"] = list(entry.get("source_tokens") or source_tokens)
+        derived_items.append(entry)
 
     links = discover_step_links(requests) if workflow else []
     execution = {
@@ -287,8 +301,9 @@ def _materialize_ir(
         "inputs": inputs,
         "sources": list(sources.values()),
         "bindings": bindings,
-        "constants": constants,
+        "constants": [],
         "identity": identity_items,
+        "derived": derived_items,
         "execution": execution,
         "steps": [
             {"idx": index, "method": request["method"], "path": request["path"],
@@ -304,6 +319,9 @@ def _materialize_ir(
     })
     if not ir.get("success"):
         ir["success"] = copy.deepcopy(last.get("success") or {})
+    from dano.execution.page.ir_integrity_p5 import synchronize_constants
+
+    synchronize_constants(ir)
     issues = validate_transaction_ir(ir)
     if issues:
         raise ValueError("Transaction IR materialization failed: " + "; ".join(issues))
@@ -406,6 +424,8 @@ def _compile_one(ir: dict, request: dict, step: int) -> dict:
 
     derived = []
     for item in ir.get("derived") or []:
+        if item.get("kind") == "array_count":
+            continue
         item_step = item.get("step")
         if isinstance(item_step, int) and item_step != step:
             continue

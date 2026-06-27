@@ -11,6 +11,7 @@ import copy
 from typing import Any
 
 from dano.execution.page.ir_compiler import compile_transaction_ir, is_ir_authoritative
+from dano.execution.page.ir_integrity_p5 import synchronize_constants
 from dano.execution.page.request_capture import _PATH_MISSING, _infer_type, _leaf_paths, _path_lookup, self_check
 from dano.execution.page.transaction_ir import validate_transaction_ir
 
@@ -295,6 +296,9 @@ def _apply_one(ir: dict, op: dict) -> tuple[bool, str]:  # noqa: C901
         source_tokens = list(op.get("source_tokens") or (source_path if isinstance(source_path, list) else []))
         if not source_tokens:
             source_tokens = [part for part in str(source_path).split(".") if part]
+        source_response = requests[source_step].get("response_json")
+        if source_response is not None and _path_lookup(source_response, source_tokens) is _PATH_MISSING:
+            return False, "source_path 在来源步响应里不存在"
         _execution(ir).setdefault("links", []).append({
             "target_step": target_step,
             "target_path": target_shown,
@@ -361,6 +365,7 @@ def apply_ir_fix_ops(api_request: dict, ops: list[dict]) -> tuple[dict, list, li
         raise ValueError("api_request is not Transaction IR authoritative")
     ir = copy.deepcopy(api_request["transaction_ir"])
     ir.pop("authority", None)
+    synchronize_constants(ir)
     compiled = compile_transaction_ir(ir)
     applied: list[dict] = []
     rejected: list[dict] = []
@@ -370,8 +375,10 @@ def apply_ir_fix_ops(api_request: dict, ops: list[dict]) -> tuple[dict, list, li
         baseline = set(self_check(compiled))
         ok, detail = _apply_one(ir, op)
         if not ok:
+            ir = before
             rejected.append({**op, "ok": False, "detail": detail})
             continue
+        synchronize_constants(ir)
         issues = validate_transaction_ir(ir)
         if issues:
             ir = before
