@@ -1,0 +1,33 @@
+name: Apply P5 Integrity Normalization
+
+on:
+  push:
+    branches:
+      - "feat/transaction-ir-compiler-p5"
+    paths:
+      - "scripts/apply_p5_integrity.py"
+      - ".github/workflows/apply-p5-integrity.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/transaction-ir-compiler-p5
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/apply_p5_integrity.py
+      - run: rm scripts/apply_p5_integrity.py .github/workflows/apply-p5-integrity.yml
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(ir): normalize dynamic locations and constants"
+          git push origin HEAD:feat/transaction-ir-compiler-p5
