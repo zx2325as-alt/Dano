@@ -1,8 +1,9 @@
 """Publish-time authority for request-captured transaction assets.
 
 Repair operates on an unsealed draft. Before publication the final executable request is
-bound to Transaction IR by stable hashes. The final sealed draft is the only P3 draft
-allowed to perform a live replay, and every call to the page publisher rechecks the seal.
+canonicalized from Transaction IR, then both IR and projection are sealed. The final sealed
+draft is the only P3 draft allowed to perform a live replay, and every page publication
+rechecks the seal and canonical projection.
 """
 from __future__ import annotations
 
@@ -41,6 +42,10 @@ def _artifact_view(api_request: dict) -> dict:
     return out
 
 
+def _expected_compiler(transaction_ir: dict) -> str:
+    return str((transaction_ir.get("compile") or {}).get("compiler") or COMPILER_VERSION)
+
+
 def authority_required(api_request: dict | None) -> bool:
     """P3 request assets require a seal even if their IR was deleted or corrupted."""
     apir = api_request or {}
@@ -52,11 +57,18 @@ def authority_required(api_request: dict | None) -> bool:
     )
 
 
+def _canonical_if_p5(api_request: dict) -> dict:
+    from dano.execution.page.ir_compiler import canonicalize_api_request, is_ir_authoritative
+
+    return canonicalize_api_request(api_request) if is_ir_authoritative(api_request) else copy.deepcopy(api_request)
+
+
 def seal_api_request(api_request: dict) -> dict:
-    """Return a sealed copy; the input object is never mutated."""
+    """Canonicalize and seal a copy; the input object is never mutated."""
     if not isinstance(api_request, dict):
         raise ValueError("api_request must be an object")
-    transaction_ir = api_request.get("transaction_ir")
+    canonical = _canonical_if_p5(api_request)
+    transaction_ir = canonical.get("transaction_ir")
     if not isinstance(transaction_ir, dict):
         raise ValueError("Transaction IR 缺失，不能建立发布权威封印")
 
@@ -67,10 +79,10 @@ def seal_api_request(api_request: dict) -> dict:
     if ir_issues:
         raise ValueError("Transaction IR 校验失败，不能封印: " + "; ".join(ir_issues))
 
-    artifact = _artifact_view(api_request)
+    artifact = _artifact_view(canonical)
     authority = {
         "version": AUTHORITY_VERSION,
-        "compiler_version": COMPILER_VERSION,
+        "compiler_version": _expected_compiler(ir_core),
         "ir_hash": _hash(ir_core),
         "artifact_hash": _hash(artifact),
         "enforce": True,
@@ -98,7 +110,7 @@ def authority_issues(api_request: dict | None) -> list[str]:
     issues: list[str] = []
     if authority.get("version") != AUTHORITY_VERSION:
         issues.append("authority: unsupported seal version")
-    if authority.get("compiler_version") != COMPILER_VERSION:
+    if authority.get("compiler_version") != _expected_compiler(transaction_ir):
         issues.append("authority: compiler version mismatch")
     if not authority.get("enforce"):
         issues.append("authority: seal is not enforced")
@@ -108,6 +120,16 @@ def authority_issues(api_request: dict | None) -> list[str]:
     actual_artifact_hash = _hash(_artifact_view(api_request))
     if authority.get("artifact_hash") != actual_artifact_hash:
         issues.append("authority: compiled api_request changed after sealing")
+
+    try:
+        from dano.execution.page.ir_compiler import canonicalize_api_request, is_ir_authoritative
+
+        if is_ir_authoritative(api_request):
+            canonical = canonicalize_api_request(api_request)
+            if _artifact_view(canonical) != _artifact_view(api_request):
+                issues.append("authority: artifact is not the canonical Transaction IR projection")
+    except Exception as exc:  # noqa: BLE001
+        issues.append(f"authority: canonical Transaction IR projection failed: {exc}")
     return issues
 
 
@@ -116,7 +138,6 @@ def verify_transaction_authority(api_request: dict | None) -> bool:
 
 
 def publish_authority_issues(asset_type: Any, body: dict | None) -> list[str]:
-    """Return hard-gate violations for a draft about to be published."""
     value = getattr(asset_type, "value", asset_type)
     if str(value) != "page_script" or not isinstance(body, dict):
         return []
@@ -131,8 +152,6 @@ def _wrap_self_check(original: Callable):
         issues = list(original(api_request, *args, **kwargs) or [])
         transaction_ir = (api_request or {}).get("transaction_ir") or {}
         authority = transaction_ir.get("authority") if isinstance(transaction_ir, dict) else None
-        # Editable drafts intentionally have no authority object. Once an authority object
-        # exists, even enforce=false or a malformed version must fail deterministic replay.
         if isinstance(authority, dict):
             for issue in authority_issues(api_request):
                 if issue not in issues:
@@ -160,8 +179,6 @@ def _wrap_sandbox_replay(original: Callable, tools_module):  # noqa: ANN001
 
         call_params = copy.deepcopy(params)
         if not _sealed(api_request):
-            # Remember the requested live plan on the first pre-seal validation, but keep
-            # every editable/unreviewed draft dry. Repair rounds cannot overwrite it.
             if run_id not in _REPLAY_PLANS and ("live" in params or "storage_state" in params):
                 _REPLAY_PLANS[run_id] = {
                     "live": bool(params.get("live")),
@@ -172,8 +189,6 @@ def _wrap_sandbox_replay(original: Callable, tools_module):  # noqa: ANN001
             call_params["verify"] = False
             return await original(run_id, call_params)
 
-        # The final sealed draft consumes the remembered plan. In a reversible sandbox it
-        # performs the one live write and fact-check; otherwise it remains an honest dry run.
         plan = _REPLAY_PLANS.pop(run_id, None)
         if plan is not None:
             call_params["live"] = bool(plan.get("live"))
