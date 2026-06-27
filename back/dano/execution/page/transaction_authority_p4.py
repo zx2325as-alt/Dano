@@ -42,12 +42,11 @@ def _artifact_view(api_request: dict) -> dict:
 
 
 def authority_required(api_request: dict | None) -> bool:
-    """P3 request assets are the first assets required to carry a P4 authority seal."""
+    """P3 request assets require a seal even if their IR was deleted or corrupted."""
     apir = api_request or {}
     marker = apir.get("option_reference") or {}
     return bool(
-        isinstance(apir.get("transaction_ir"), dict)
-        and isinstance(marker, dict)
+        isinstance(marker, dict)
         and marker.get("version") == "option-reference/v1"
         and marker.get("required")
     )
@@ -132,7 +131,9 @@ def _wrap_self_check(original: Callable):
         issues = list(original(api_request, *args, **kwargs) or [])
         transaction_ir = (api_request or {}).get("transaction_ir") or {}
         authority = transaction_ir.get("authority") if isinstance(transaction_ir, dict) else None
-        if isinstance(authority, dict) and authority.get("enforce"):
+        # Editable drafts intentionally have no authority object. Once an authority object
+        # exists, even enforce=false or a malformed version must fail deterministic replay.
+        if isinstance(authority, dict):
             for issue in authority_issues(api_request):
                 if issue not in issues:
                     issues.append(issue)
