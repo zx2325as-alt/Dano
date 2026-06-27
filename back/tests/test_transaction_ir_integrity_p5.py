@@ -158,9 +158,9 @@ def workflow_fixture(*, automatic_link: bool) -> dict:
         "method": "POST",
         "url": "https://oa.example/api/draft",
         "post_data": '{"draft":{"reason":"回家"}}',
-        "response_json": {"code": 0, "data": {"taskId": "T-1"}},
+        "response_json": {"code": 0, "data": {"taskId": "TASK-0001"}},
     }
-    task_id = "T-1" if automatic_link else "UNRELATED"
+    task_id = "TASK-0001" if automatic_link else "UNRELATED"
     second = {
         "method": "POST",
         "url": "https://oa.example/api/submit",
