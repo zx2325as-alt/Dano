@@ -1,8 +1,8 @@
 """Infer transaction dataflow from a recorded page request.
 
-This module is the boundary between browser capture and request compilation.
-It turns captured writes, reads and form samples into Transaction IR plus the
-UI-facing field/select suggestions used by the recorder.
+This module is the boundary between browser capture and request compilation. It turns
+captured writes, reads and form samples into Transaction IR plus the UI-facing
+field/select suggestions used by the recorder.
 """
 
 from __future__ import annotations
@@ -42,6 +42,18 @@ def _select_source_id(s: dict) -> str:
     return stable_source_id(s.get("source_url"), s.get("value_key"), s.get("label_key"))
 
 
+def _inference_evidence(inference: dict | None) -> list[str]:
+    refs: list[str] = []
+    for item in (inference or {}).get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        for ref in item.get("evidence_refs") or []:
+            value = str(ref or "")
+            if value and value not in refs:
+                refs.append(value)
+    return refs
+
+
 def _source_specs(selects: list[dict], trace_ir: dict | None = None) -> list[SourceSpec]:
     out: dict[str, SourceSpec] = {}
     for s in selects or []:
@@ -52,16 +64,27 @@ def _source_specs(selects: list[dict], trace_ir: dict | None = None) -> list[Sou
         if sid in out:
             continue
         evidence_ref = event_for_url(trace_ir, url, "read")
+        evidence = [evidence_ref] if evidence_ref else []
+        for ref in _inference_evidence(s.get("option_query_inference")):
+            if ref not in evidence:
+                evidence.append(ref)
+        records_path = s.get("source_records_path")
+        if not isinstance(records_path, list):
+            records_path = []
         out[sid] = SourceSpec(
             id=sid,
             kind="http_list",
             url=url,
+            method=str(s.get("source_method") or "GET").upper(),
+            records_path=list(records_path),
+            query_protocol=dict(s.get("option_query") or {}),
+            inference=dict(s.get("option_query_inference") or {}),
             value_key=str(s.get("value_key") or ""),
             label_key=str(s.get("label_key") or ""),
             count=s.get("count"),
             options=list(s.get("options") or []),
             option_filter=dict(s.get("option_filter") or {}) or None,
-            evidence=[evidence_ref] if evidence_ref else [],
+            evidence=evidence,
         )
     return list(out.values())
 

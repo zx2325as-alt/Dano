@@ -22,10 +22,13 @@ from dano.execution.page.option_p0_security import install_option_p0_security
 from dano.execution.page.option_query_p1 import install_option_query_p1
 from dano.execution.page.option_query_p1_validation import install_option_query_p1_validation
 from dano.execution.page.option_query_p1_contract import install_option_query_p1_contract
+from dano.execution.page.option_query_inference_p2 import install_option_query_inference_p2
+from dano.execution.page.option_query_validation_p2 import install_option_query_validation_p2
 
-# P0 establishes safe replay and fail-closed candidate integrity. P1 is installed after
-# every P0 gate, then receives deterministic protocol validation. The public capability
-# projection is installed last so success and intentional waiting states share one contract.
+# P0 establishes safe replay and fail-closed candidate integrity. P1 defines the typed
+# query runtime and public contract. P2 may infer only evidence-proven query relations.
+# The final P2 validation layer may use a recorded label only to issue a live search; the
+# submitted stable value must still be present in the live response before any write.
 install_option_p0()
 install_option_p0_compat()
 install_option_p0_quality()
@@ -35,6 +38,8 @@ install_option_p0_security()
 install_option_query_p1()
 install_option_query_p1_validation()
 install_option_query_p1_contract()
+install_option_query_inference_p2()
+install_option_query_validation_p2()
 
 __all__ = ["FakePageDriver", "PageDriver", "PageActionRuntime", "build_page_runtime",
            "scout_dom", "to_recorded_steps"]
