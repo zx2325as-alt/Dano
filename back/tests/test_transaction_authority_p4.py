@@ -12,6 +12,7 @@ from dano.execution.page.transaction_authority_p4 import (
     _REPLAY_PLANS,
     _wrap_publish_asset,
     _wrap_sandbox_replay,
+    _wrap_self_check,
     authority_issues,
     publish_authority_issues,
     seal_api_request,
@@ -74,6 +75,16 @@ def test_ir_artifact_and_compiler_tampering_are_detected() -> None:
     assert "authority: compiler version mismatch" in authority_issues(compiler_changed)
 
 
+def test_self_check_rejects_disabled_or_malformed_existing_seal() -> None:
+    sealed = seal_api_request(api_request_fixture())
+    sealed["transaction_ir"]["authority"]["enforce"] = False
+    wrapped = _wrap_self_check(lambda _api_request: [])
+
+    issues = wrapped(sealed)
+
+    assert "authority: seal is not enforced" in issues
+
+
 def test_invalid_transaction_ir_cannot_be_sealed() -> None:
     request = api_request_fixture()
     request["transaction_ir"]["version"] = "invalid"
@@ -86,6 +97,12 @@ def test_publish_gate_requires_seal_only_for_p3_page_assets() -> None:
     unsealed = api_request_fixture()
     assert publish_authority_issues(AssetType.PAGE_SCRIPT, {"api_request": unsealed}) == [
         "authority: seal missing"
+    ]
+
+    missing_ir = copy.deepcopy(unsealed)
+    missing_ir.pop("transaction_ir")
+    assert publish_authority_issues(AssetType.PAGE_SCRIPT, {"api_request": missing_ir}) == [
+        "authority: transaction_ir missing"
     ]
 
     sealed = seal_api_request(unsealed)
