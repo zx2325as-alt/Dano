@@ -537,6 +537,9 @@ async def _request_fields_msg(chosen: dict, candidates: list[dict], samples: dic
                               trace_ir: dict | None = None) -> dict:
     """构造 request_fields 消息:事务 IR + 字段表 + 候选请求 + select(Q2)+ identity(Q1)。"""
     from dano.execution.page.dataflow import build_transaction_ir, infer_request_transaction
+    from dano.execution.page.option_query_review_p2 import (
+        prepare_reviewable_selects, public_selects, public_transaction_ir, trusted_identity,
+    )
 
     def _path(u: str) -> str:
         i = u.find("//")
@@ -546,8 +549,8 @@ async def _request_fields_msg(chosen: dict, candidates: list[dict], samples: dic
     tx = infer_request_transaction(chosen, candidates, samples, reads, storage, required_labels,
                                    trace_ir=trace_ir)
     fields = tx["fields"]
-    selects = tx["selects"]
-    identity = tx["identity"]
+    server_selects = prepare_reviewable_selects(tx["selects"])
+    server_identity = trusted_identity(tx["identity"])
     # LLM 字段语义增强(最佳努力):只给"确定性没把握(名字仍=原始 key)"的字段补中文名;确信的不覆盖,失败不影响。
     try:
         from dano.agent_tools import tools as _T
@@ -562,20 +565,24 @@ async def _request_fields_msg(chosen: dict, candidates: list[dict], samples: dic
     except Exception:  # noqa: BLE001
         pass
     tx["transaction_ir"] = build_transaction_ir(chosen=chosen, candidates=candidates, fields=fields,
-                                                selects=selects, identity=identity, samples=samples,
+                                                selects=server_selects, identity=server_identity, samples=samples,
                                                 reads=reads or [], mirrors=tx.get("derived_mirrors") or [],
                                                 trace_ir=trace_ir)
+    server_ir = tx["transaction_ir"]
     return {"type": "request_fields",
-            "method": (chosen.get("method") or "POST").upper(), "url": chosen.get("url"),
+            "method": (chosen.get("method") or "POST").upper(), "url": _path(chosen.get("url") or ""),
             "fields": fields,
             "candidates": cand_list, "chosen_idx": candidates.index(chosen) if chosen in candidates else 0,
             "suggested_steps": tx["suggested_steps"],   # 自动建议哪几条组成业务流程(前端预勾)
-            "selects": selects,
-            "identity": identity,
+            "selects": public_selects(server_selects),
+            "identity": [{"path": item.get("path")} for item in server_identity if item.get("path")],
             "trace_ir": {"version": (trace_ir or {}).get("version"),
                          "capture_hash": (trace_ir or {}).get("capture_hash"),
                          "trace_hash": (trace_ir or {}).get("trace_hash")},
-            "transaction_ir": tx["transaction_ir"]}   # 字段=当前用户/会话值(运行期重取;排除用户填值/平凡撞值)
+            "transaction_ir": public_transaction_ir(server_ir),
+            "_server_selects": server_selects,
+            "_server_identity": server_identity,
+            "_server_transaction_ir": server_ir}
 
 
 def _trusted_transaction_ir(server_ir: dict | None, client_ir: dict | None,
@@ -646,6 +653,8 @@ async def record_ws(ws: WebSocket) -> None:
         pending_storage: dict | None = None    # 登录态(认 identity 字段)
         pending_required: set = set()          # 录制时表单 * 必填的字段标签
         pending_ir: dict | None = None         # 事务级 IR: inputs/sources/bindings/constants/success 的权威捕获模型
+        pending_selects: list[dict] = []       # 服务端权威 select/query 元数据
+        pending_identity: list[dict] = []      # 服务端权威 identity 绑定
         pending_trace: dict | None = None      # Trace IR:录制事实时间线(仅 hash/事件引用进前端协议)
         while True:
             msg = await ws.receive_json()
@@ -708,7 +717,9 @@ async def record_ws(ws: WebSocket) -> None:
                     pending_req = chosen
                     rf = await _request_fields_msg(chosen, cands, samples, pending_reads,
                                                    pending_storage, pending_required, pending_trace)
-                    pending_ir = rf.get("transaction_ir")
+                    pending_ir = rf.pop("_server_transaction_ir", None)
+                    pending_selects = rf.pop("_server_selects", [])
+                    pending_identity = rf.pop("_server_identity", [])
                     await ws.send_json(rf)
                     continue
 
@@ -747,7 +758,9 @@ async def record_ws(ws: WebSocket) -> None:
                     pending_req = pending_candidates[idx]
                     rf = await _request_fields_msg(pending_req, pending_candidates, pending_samples,
                                                    pending_reads, pending_storage, pending_required, pending_trace)
-                    pending_ir = rf.get("transaction_ir")
+                    pending_ir = rf.pop("_server_transaction_ir", None)
+                    pending_selects = rf.pop("_server_selects", [])
+                    pending_identity = rf.pop("_server_identity", [])
                     await ws.send_json(rf)
             elif t == "publish_request":
                 # 用户在字段表里勾了哪些是参数、起了名 → 用真实提交请求建 Skill(任意 OA 通用)
@@ -760,9 +773,20 @@ async def record_ws(ws: WebSocket) -> None:
                                                              compile_api_workflow_from_ir)
                 from dano.execution.page.request_capture import (auto_required_fields, infer_success_rule,
                                                                  suggest_fact_check, suggest_workflow_steps)
-                sels = msg.get("selects") or []         # Q2 选领导:展示 label、提交 value
-                idens = msg.get("identity") or []        # Q1 当前用户:运行期重取
-                tx_ir = _trusted_transaction_ir(pending_ir, msg.get("transaction_ir"), pending_trace)
+                from dano.execution.page.option_query_review_p2 import (
+                    apply_option_review_decisions, synchronize_transaction_ir, trusted_identity,
+                )
+                try:
+                    sels = apply_option_review_decisions(pending_selects, msg.get("option_query_decisions"))
+                except ValueError as exc:
+                    await ws.send_json({"type": "result", "report": {"ok": False, "reason": str(exc)}})
+                    continue
+                idens = trusted_identity(pending_identity)
+                reviewed_ir = synchronize_transaction_ir(pending_ir, sels)
+                tx_ir = _trusted_transaction_ir(reviewed_ir, None, pending_trace)
+                if tx_ir is None:
+                    await ws.send_json({"type": "result", "report": {"ok": False, "reason": "服务端事务模型校验失败，请重新录制"}})
+                    continue
                 fc = suggest_fact_check(pending_samples, pending_reads)   # 回查源(录到"我的记录"列表才有)
                 sr = infer_success_rule(pending_reads)   # 学这套系统自己的"业务成功"约定(不挑系统,见 P0#2)
                 # 多步:用户勾了哪几条(step_idxs,有序);**没勾则自动判流程**(提交锚点+数据依赖,丢噪声)

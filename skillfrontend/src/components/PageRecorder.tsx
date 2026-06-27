@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Card, Form, Input, Button, Space, Typography, Alert, Tag, List, Checkbox, Collapse, Switch, message } from "antd";
 import { useNavigate } from "react-router-dom";
-import OptionInferenceSummary, { OptionQueryInferenceView, OptionQueryProtocolView } from "./OptionInferenceSummary";
+import OptionInferenceSummary, { OptionCapabilitiesView, OptionQueryInferenceView, OptionReviewDecision } from "./OptionInferenceSummary";
 
 // 方式B:网页内录制。连 WebSocket → 后端托管浏览器,画面投到这里,点击/键盘回传,实时显示捕获的步骤。
 // 客户全程免安装、免命令行。
@@ -16,8 +16,8 @@ interface RecField { path: string; key: string; value: string; suggest_param: bo
 interface RecCand { idx: number; method: string; path: string }
 // P3:字段=选自某列表(展示 label、提交 value)/ 字段=当前用户·会话值(运行期重取)
 interface RecSelect {
-  path: string; source_url: string; value_key: string; label_key: string; label: string; count: number;
-  option_query?: OptionQueryProtocolView; option_query_inference?: OptionQueryInferenceView;
+  path: string; label: string; count: number; kind?: string;
+  capabilities?: OptionCapabilitiesView; inference?: OptionQueryInferenceView;
 }
 interface RecIdentity { path: string; source: string }
 interface RecResult {
@@ -61,7 +61,7 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
   const [stepSel, setStepSel] = useState<Record<number, boolean>>({});   // 多步:勾入工作流的写请求 idx
   const [selects, setSelects] = useState<Record<string, RecSelect>>({});      // path → select 建议
   const [identity, setIdentity] = useState<Record<string, RecIdentity>>({});  // path → identity 建议
-  const [transactionIr, setTransactionIr] = useState<Record<string, any> | null>(null);
+  const [reviewDecisions, setReviewDecisions] = useState<Record<string, OptionReviewDecision>>({});
   const [action, setAction] = useState("submit_form");
   const [title, setTitle] = useState("");
   const [result, setResult] = useState<RecResult | null>(null);
@@ -78,7 +78,7 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
   function start() {
     if (!tenant) { message.error("请先到「创建 / 进入租户」"); return; }
     if (!startUrl.trim()) { message.error("请填页面地址 start_url"); return; }
-    setErr(""); setResult(null); setSteps([]); setReqs([]); setFrame(""); setFields([]); setPicked({}); setCands([]); setSelects({}); setIdentity({}); setTransactionIr(null); setStepSel({});
+    setErr(""); setResult(null); setSteps([]); setReqs([]); setFrame(""); setFields([]); setPicked({}); setCands([]); setSelects({}); setIdentity({}); setReviewDecisions({}); setStepSel({});
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/onboarding/page/record`);
     wsRef.current = ws;
@@ -108,8 +108,7 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
         (m.selects || []).forEach((s: RecSelect) => { selMap[s.path] = s; });
         const idMap: Record<string, RecIdentity> = {};
         (m.identity || []).forEach((i: RecIdentity) => { idMap[i.path] = i; });
-        setSelects(selMap); setIdentity(idMap);
-        setTransactionIr(m.transaction_ir || null);
+        setSelects(selMap); setIdentity(idMap); setReviewDecisions({});
         setFields(fs);
         const pk: Record<string, { on: boolean; name: string }> = {};
         fs.forEach((f) => {
@@ -129,7 +128,7 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
       }
       else if (m.type === "result") {   // 留在录制现场:不关浏览器、不重来
         setResult(m.report); setPhase("recording");
-        if (m.report?.ok) { setFields([]); setPicked({}); setCands([]); setSelects({}); setIdentity({}); setTransactionIr(null); setStepSel({}); }   // 发布成功 → 收起字段表
+        if (m.report?.ok) { setFields([]); setPicked({}); setCands([]); setSelects({}); setIdentity({}); setReviewDecisions({}); setStepSel({}); }   // 发布成功 → 收起字段表
       }
       else if (m.type === "error") { setErr(m.detail || "录制出错"); setPhase("idle"); }
     };
@@ -196,27 +195,33 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
   function _payload() {
     const param_map: Record<string, string> = {};
     fields.forEach((f) => { const p = picked[f.path]; if (p?.on && p.name.trim()) param_map[f.path] = p.name.trim(); });
-    const selList = Object.values(selects).filter((s) => param_map[s.path]);   // 选领导:仅作为参数的
-    const idList = Object.values(identity);                                     // 当前用户:运行期重取
+    const option_query_decisions = Object.values(selects)
+      .map((s) => s.inference?.review_id)
+      .filter((reviewId): reviewId is string => !!reviewId)
+      .map((reviewId) => ({ review_id: reviewId, decision: reviewDecisions[reviewId] }));
     // 多步(Q3):勾了 ≥2 个写请求 → 组成工作流,提交那步(chosenIdx)放最后(参数落它)
     const checked = cands.filter((c) => stepSel[c.idx]).map((c) => c.idx);
     const step_idxs = checked.length >= 2
       ? [...checked.filter((i) => i !== chosenIdx).sort((a, b) => a - b), chosenIdx] : [];
-    return { param_map, selList, idList, step_idxs };
+    return { param_map, option_query_decisions, step_idxs };
   }
   function publishRequest() {
     if (!action.trim() || badAction(action.trim())) return;
-    const { param_map, selList, idList, step_idxs } = _payload();
+    const unresolved = Object.values(selects)
+      .map((s) => s.inference?.review_id)
+      .filter((reviewId): reviewId is string => !!reviewId && !reviewDecisions[reviewId]);
+    if (unresolved.length) { message.error(`还有 ${unresolved.length} 条查询能力需要确认`); return; }
+    const { param_map, option_query_decisions, step_idxs } = _payload();
     if (!Object.keys(param_map).length) { message.error("至少勾选一个字段作为参数"); return; }
     setResult(null); setPhase("publishing");
     // 一键发布:后端自动提炼业务 Goal + self_check + 审核 + 自动修复;必填也由后端**自动判定**
     //(默认全部必填,表单抓到 * 区分时据 * 降级可选),无需手动勾选/确认
     send({ type: "publish_request", action: action.trim(), title: title.trim(),
-           param_map, selects: selList, identity: idList, step_idxs, transaction_ir: transactionIr });
+           param_map, option_query_decisions, step_idxs });
   }
   function stopAll() {
     send({ type: "stop" }); wsRef.current?.close();
-    setPhase("idle"); setResult(null); setSteps([]); setFrame(""); setFields([]); setPicked({}); setCands([]); setSelects({}); setIdentity({}); setTransactionIr(null); setStepSel({});
+    setPhase("idle"); setResult(null); setSteps([]); setFrame(""); setFields([]); setPicked({}); setCands([]); setSelects({}); setIdentity({}); setReviewDecisions({}); setStepSel({});
   }
 
   return (
@@ -329,9 +334,17 @@ export default function PageRecorder({ tenant, subsystem, baseUrl, storageState 
                         <Typography.Text code style={{ fontSize: 12 }}>{f.path}</Typography.Text>
                         {sel && <>
                           <Tag color="purple" style={{ fontSize: 11 }}>
-                            📋 选自列表 {sel.label_key}→{sel.value_key}(共{sel.count}项)
+                            📋 选自列表（共{sel.count}项）
                           </Tag>
-                          <OptionInferenceSummary select={sel} />
+                          <OptionInferenceSummary
+                            select={sel}
+                            decision={sel.inference?.review_id ? reviewDecisions[sel.inference.review_id] : undefined}
+                            onDecision={sel.inference?.review_id
+                              ? (decision) => setReviewDecisions((current) => ({
+                                  ...current, [sel.inference!.review_id!]: decision,
+                                }))
+                              : undefined}
+                          />
                         </>}
                         {idn && <Tag color="gold" style={{ fontSize: 11 }}>🔒 当前用户/会话值(运行期自动填)</Tag>}
                         {!sel && !idn && (f.suggest_param
