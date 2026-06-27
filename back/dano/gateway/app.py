@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dano.assets.repository import AssetRepository
 from dano.catalog.manifest import build_function_tools, build_manifests, skill_id_of
@@ -1014,6 +1014,10 @@ async def call_tool(req: ToolCallReq, x_tenant_key: str | None = Header(default=
 class ToolOptionsReq(BaseModel):
     name: str                       # 工具名(= skill_id 点转 __)
     field: str                      # 要列可选项的**参数名**(选择型字段)
+    query: str | None = Field(default=None, max_length=256)
+    cursor: str | int | None = None
+    limit: int = Field(default=50, ge=1, le=100)
+    context: dict = Field(default_factory=dict)
 
 
 @app.post("/v1/tools/options")
@@ -1026,7 +1030,11 @@ async def tool_options(req: ToolOptionsReq, x_tenant_key: str | None = Header(de
     if not action:
         raise HTTPException(status_code=400, detail="name 应能解析为 {subsystem}.{action}")
     orch = await _orchestrator(tenant)
-    return await orch.list_field_options(Subsystem(sub_str), action, req.field, tenant=tenant)
+    return await orch.list_field_options(
+        Subsystem(sub_str), action, req.field,
+        tenant=tenant, query=req.query, cursor=req.cursor,
+        limit=req.limit, context=req.context,
+    )
 
 
 class ExportSkillsReq(BaseModel):

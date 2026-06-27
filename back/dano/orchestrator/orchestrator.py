@@ -541,7 +541,9 @@ class Orchestrator:
         )
 
     async def list_field_options(self, subsystem: Subsystem, action: str, field: str,
-                                 *, tenant: str = "") -> dict:
+                                 *, tenant: str = "", query: str | None = None,
+                                 cursor: str | int | None = None, limit: int = 50,
+                                 context: dict | None = None) -> dict:
         """**实时**列出某选择型字段的当前可选项 —— 直接调它的来源接口,带运行期登录态(与 invoke 同一套配置)。
         问题1:把接口放进 skill。选字段前先拉真实选项,agent 从中选,不凭空猜、不靠过时快照。失败 → options=[]。"""
         import json as _json
@@ -570,8 +572,11 @@ class Orchestrator:
         override = await get_token_headers(tenant, skill.subsystem.value)   # 运行期最新鉴权头(治焊死旧 token 过期)
         if override:
             apir = merge_auth_headers(apir, override)
-        return await fetch_field_options(apir, field, base_url=base_url, storage_state=storage,
-                                         verify=tls_verify())
+        return await fetch_field_options(
+            apir, field, base_url=base_url, storage_state=storage,
+            verify=tls_verify(), query=query, cursor=cursor,
+            limit=limit, context=context,
+        )
 
     async def _run_page(self, task_id, skill, intent, *, confirm, tenant="") -> TaskOutcome:  # noqa: ANN001
         """无 API 页面辅助执行(流程8)。有 api_request(抓请求路径)则直接发请求,不开浏览器。"""

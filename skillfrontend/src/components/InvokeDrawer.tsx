@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Drawer, Button, Checkbox, Input, InputNumber, DatePicker, Radio, Select, Typography, Tag,
   Alert, Descriptions, Space, message, Image,
@@ -14,11 +14,21 @@ const STATE_COLOR: Record<string, string> = {
 
 const OPTION_READY = new Set(["ok", "empty"]);
 const OPTION_NON_ERROR = new Set(["idle", "loading", "ok", "empty"]);
+const OPTION_WAITING = new Set(["missing_dependency", "query_required", "query_too_short"]);
 
 type OptionLoadState = {
   status: string;
   message?: string;
   httpStatus?: number;
+  searchSupported?: boolean;
+  validationSupported?: boolean;
+  dependsOn?: string[];
+  missingDependencies?: string[];
+  minQueryLength?: number;
+  nextCursor?: string | number | null;
+  hasMore?: boolean;
+  total?: number | null;
+  query?: string;
 };
 
 // 候选项标识:优先 id,否则第一个值(与后端 _candidate_id 一致)
@@ -45,7 +55,7 @@ function normalizeOptions(p: JSONSchemaProperty): ToolOption[] {
     const rec = item as Record<string, unknown>;
     const label = typeof item === "object" && item !== null && "label" in rec ? String(rec.label ?? "") : String(item ?? "");
     const rawValue = typeof item === "object" && item !== null && "value" in rec ? rec.value : item;
-    const value = typeof rawValue === "number" ? rawValue : String(rawValue ?? "");
+    const value = typeof rawValue === "number" || typeof rawValue === "boolean" ? rawValue : String(rawValue ?? "");
     if (!label) continue;
     const key = `${label}\u0000${String(value)}`;
     if (seen.has(key)) continue;
@@ -62,7 +72,7 @@ function jsonSkeleton(p: JSONSchema): string {
 }
 
 function isOptionSourceFailure(state?: OptionLoadState): boolean {
-  return !!state && !OPTION_NON_ERROR.has(state.status);
+  return !!state && !OPTION_NON_ERROR.has(state.status) && !OPTION_WAITING.has(state.status);
 }
 
 export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest | null; onClose: () => void }) {
@@ -76,11 +86,16 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
   const [optionCache, setOptionCache] = useState<Record<string, ToolOption[]>>({});
   const [optionLoading, setOptionLoading] = useState<Record<string, boolean>>({});
   const [optionState, setOptionState] = useState<Record<string, OptionLoadState>>({});
+  const optionSearchTimers = useRef<Record<string, number>>({});
+  const optionRequestSeq = useRef<Record<string, number>>({});
 
   const props = useMemo(() => skill?.parameters?.properties || {}, [skill]);
   const required = useMemo(() => new Set(skill?.parameters?.required || []), [skill]);
 
   useEffect(() => {
+    for (const timer of Object.values(optionSearchTimers.current)) window.clearTimeout(timer);
+    optionSearchTimers.current = {};
+    optionRequestSeq.current = {};
     if (skill) {
       setValues({});
       setText(jsonSkeleton(skill.parameters));
@@ -91,59 +106,149 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
       setOptionLoading({});
       setOptionState({});
     }
+    return () => {
+      for (const timer of Object.values(optionSearchTimers.current)) window.clearTimeout(timer);
+      optionSearchTimers.current = {};
+      for (const field of Object.keys(optionRequestSeq.current)) optionRequestSeq.current[field] += 1;
+    };
   }, [skill]);
 
-  const setVal = (k: string, v: unknown) => setValues((p) => ({ ...p, [k]: v }));
+  const setVal = (k: string, v: unknown) => {
+    const dependents = Object.keys(props).filter((field) => {
+      const declared = props[field]?.["x-options-depends-on"] || [];
+      return declared.includes(k) || optionState[field]?.dependsOn?.includes(k);
+    });
+    setValues((prev) => {
+      const next = { ...prev, [k]: v };
+      for (const field of dependents) delete next[field];
+      return next;
+    });
+    if (dependents.length) {
+      setOptionCache((prev) => {
+        const next = { ...prev };
+        for (const field of dependents) delete next[field];
+        return next;
+      });
+      setOptionState((prev) => {
+        const next = { ...prev };
+        for (const field of dependents) {
+          next[field] = { ...prev[field], status: "idle", message: undefined, nextCursor: null, hasMore: false };
+          optionRequestSeq.current[field] = (optionRequestSeq.current[field] || 0) + 1;
+        }
+        return next;
+      });
+    }
+  };
 
-  async function loadOptions(key: string, p: JSONSchemaProperty, force = false) {
-    if (!skill || optionLoading[key]) return;
+  async function loadOptions(
+    key: string,
+    p: JSONSchemaProperty,
+    force = false,
+    query = "",
+    cursor?: string | number | null,
+  ) {
+    if (!skill) return;
     const dynamic = !!p?.["x-options-source"];
     if (!dynamic) {
       if (!(key in optionCache)) setOptionCache((prev) => ({ ...prev, [key]: normalizeOptions(p) }));
       return;
     }
-    if (!force && OPTION_READY.has(optionState[key]?.status || "")) return;
+    const append = cursor !== undefined && cursor !== null;
+    if (append && optionLoading[key]) return;
+    const state = optionState[key];
+    const remoteSearch = !!p?.["x-options-search"] || !!state?.searchSupported;
+    if (!force && !append && !query && OPTION_READY.has(state?.status || "") && !remoteSearch) return;
 
+    const seq = (optionRequestSeq.current[key] || 0) + 1;
+    optionRequestSeq.current[key] = seq;
     setOptionLoading((prev) => ({ ...prev, [key]: true }));
-    setOptionState((prev) => ({ ...prev, [key]: { status: "loading" } }));
+    setOptionState((prev) => ({ ...prev, [key]: { ...prev[key], status: "loading", query } }));
     try {
-      const res = await listSkillOptions(skill.name, key);
+      const res = await listSkillOptions(skill.name, key, {
+        query: query || undefined,
+        cursor: cursor ?? undefined,
+        limit: 50,
+        context: values,
+      });
+      if (optionRequestSeq.current[key] !== seq) return;
       const status = res.source_status || ((res.options || []).length ? "ok" : "empty");
+      const capability = {
+        searchSupported: !!res.search_supported || !!p?.["x-options-search"],
+        validationSupported: !!res.validation_supported || !!p?.["x-options-validation"],
+        dependsOn: res.depends_on || p?.["x-options-depends-on"] || [],
+        missingDependencies: res.missing_dependencies,
+        minQueryLength: res.min_query_length ?? p?.["x-options-min-query-length"],
+        nextCursor: res.next_cursor,
+        hasMore: !!res.has_more,
+        total: res.total,
+        query,
+      };
       if (OPTION_READY.has(status)) {
-        setOptionCache((prev) => ({ ...prev, [key]: res.options || [] }));
+        setOptionCache((prev) => {
+          const incoming = res.options || [];
+          if (!append) return { ...prev, [key]: incoming };
+          const merged = [...(prev[key] || []), ...incoming];
+          const seen = new Set<string>();
+          return {
+            ...prev,
+            [key]: merged.filter((item) => {
+              const id = `${item.label}\u0000${String(item.value)}`;
+              if (seen.has(id)) return false;
+              seen.add(id);
+              return true;
+            }),
+          };
+        });
         setOptionState((prev) => ({
           ...prev,
-          [key]: { status, message: res.note, httpStatus: res.http_status },
+          [key]: { status, message: res.note, httpStatus: res.http_status, ...capability },
         }));
-        if (status === "empty" && res.note) message.info(res.note);
+        if (status === "empty" && res.note && !query) message.info(res.note);
       } else {
-        // 动态来源失败时不使用录制快照，也不保留之前选中的旧值。
         setOptionCache((prev) => {
+          const next = { ...prev };
+          if (!append) delete next[key];
+          return next;
+        });
+        setValues((prev) => {
           const next = { ...prev };
           delete next[key];
           return next;
         });
-        setVal(key, undefined);
         const detail = res.note || `候选来源不可用（${status}）`;
         setOptionState((prev) => ({
           ...prev,
-          [key]: { status, message: detail, httpStatus: res.http_status },
+          [key]: { status, message: detail, httpStatus: res.http_status, ...capability },
         }));
-        message.error(`${key}：${detail}`);
+        if (!OPTION_WAITING.has(status)) message.error(`${key}：${detail}`);
       }
     } catch (e: any) {
+      if (optionRequestSeq.current[key] !== seq) return;
       setOptionCache((prev) => {
+        const next = { ...prev };
+        if (!append) delete next[key];
+        return next;
+      });
+      setValues((prev) => {
         const next = { ...prev };
         delete next[key];
         return next;
       });
-      setVal(key, undefined);
       const detail = e?.response?.data?.detail || e.message || "候选来源请求失败";
-      setOptionState((prev) => ({ ...prev, [key]: { status: "network_error", message: detail } }));
+      setOptionState((prev) => ({ ...prev, [key]: { ...prev[key], status: "network_error", message: detail } }));
       message.error(`拉取 ${key} 候选失败：${detail}`);
     } finally {
-      setOptionLoading((prev) => ({ ...prev, [key]: false }));
+      if (optionRequestSeq.current[key] === seq) {
+        setOptionLoading((prev) => ({ ...prev, [key]: false }));
+      }
     }
+  }
+
+  function scheduleOptionSearch(key: string, p: JSONSchemaProperty, query: string) {
+    if (optionSearchTimers.current[key]) window.clearTimeout(optionSearchTimers.current[key]);
+    optionSearchTimers.current[key] = window.setTimeout(() => {
+      loadOptions(key, p, true, query);
+    }, 250);
   }
 
   async function doInvoke(input: Record<string, unknown>) {
@@ -200,7 +305,9 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
     if (isSelectProp(p)) {
       const dynamic = !!p?.["x-options-source"];
       const state = optionState[key];
+      const sourceWaiting = dynamic && OPTION_WAITING.has(state?.status || "");
       const sourceFailed = dynamic && isOptionSourceFailure(state);
+      const remoteSearch = !!p?.["x-options-search"] || !!state?.searchSupported;
       const options = dynamic ? (optionCache[key] || []) : normalizeOptions(p);
       const multi = isMultiSelectProp(p);
       widget = (
@@ -209,6 +316,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           showSearch
           allowClear
           optionFilterProp="label"
+          filterOption={remoteSearch ? false : undefined}
           style={{ width: "100%" }}
           value={(values[key] as any) ?? undefined}
           options={options}
@@ -217,16 +325,46 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
           placeholder={dynamic ? `打开下拉实时加载${label}` : key}
           notFoundContent={
             optionLoading[key] ? "正在加载候选…"
-              : sourceFailed ? "候选来源不可用"
-                : state?.status === "empty" ? "当前条件下没有可选项"
-                  : dynamic ? "打开下拉加载实时候选" : "无可选项"
+              : sourceWaiting ? (state?.message || "请先补充查询条件")
+                : sourceFailed ? "候选来源不可用"
+                  : state?.status === "empty" ? "当前条件下没有可选项"
+                    : dynamic ? "打开下拉加载实时候选" : "无可选项"
           }
           onFocus={() => loadOptions(key, p)}
           onDropdownVisibleChange={(open) => { if (open) loadOptions(key, p); }}
+          onSearch={(text) => { if (remoteSearch) scheduleOptionSearch(key, p, text); }}
+          dropdownRender={(menu) => (
+            <>
+              {menu}
+              {state?.hasMore && (
+                <div style={{ borderTop: "1px solid #f0f0f0", padding: 6, textAlign: "center" }}>
+                  <Button
+                    type="link"
+                    size="small"
+                    loading={!!optionLoading[key]}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => loadOptions(key, p, true, state.query || "", state.nextCursor)}
+                  >
+                    加载更多{state.total != null ? `（共 ${state.total} 项）` : ""}
+                  </Button>
+                </div>
+              )}
+            </>
+          )}
           onChange={(v) => setVal(key, v)}
         />
       );
-      if (sourceFailed) {
+      if (sourceWaiting) {
+        sourceHint = (
+          <Alert
+            style={{ marginTop: 6 }}
+            type="warning"
+            showIcon
+            message={state?.message || "请先补充候选查询条件"}
+            description={state?.missingDependencies?.length ? `依赖字段：${state.missingDependencies.join("、")}` : undefined}
+          />
+        );
+      } else if (sourceFailed) {
         sourceHint = (
           <Alert
             style={{ marginTop: 6 }}
@@ -234,7 +372,7 @@ export default function InvokeDrawer({ skill, onClose }: { skill: SkillManifest 
             showIcon
             message={state?.message || "动态候选来源不可用"}
             description={state?.httpStatus ? `HTTP ${state.httpStatus}` : undefined}
-            action={<Button size="small" onClick={() => loadOptions(key, p, true)}>重试</Button>}
+            action={<Button size="small" onClick={() => loadOptions(key, p, true, state?.query || "")}>重试</Button>}
           />
         );
       } else if (dynamic && state?.status === "empty") {

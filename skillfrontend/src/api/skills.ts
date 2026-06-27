@@ -46,6 +46,11 @@ export interface JSONSchemaProperty {
   "x-submit-mode"?: "value" | string;
   "x-option-label"?: string;
   "x-option-value"?: string;
+  "x-options-search"?: boolean;
+  "x-options-min-query-length"?: number;
+  "x-options-depends-on"?: string[];
+  "x-options-pagination"?: "page" | "offset" | "cursor" | string;
+  "x-options-validation"?: boolean;
 }
 
 export interface ToolOption {
@@ -81,7 +86,24 @@ export type OptionSourceStatus =
   | "ambiguous_labels"
   | "too_many_options"
   | "response_too_large"
+  | "missing_dependency"
+  | "query_required"
+  | "query_too_short"
+  | "query_too_long"
+  | "invalid_cursor"
+  | "invalid_context"
+  | "invalid_query_protocol"
+  | "validation_unsupported"
   | "source_error";
+
+export type OptionCursor = string | number;
+
+export interface ToolOptionsQuery {
+  query?: string;
+  cursor?: OptionCursor;
+  limit?: number;
+  context?: Record<string, unknown>;
+}
 
 export interface ToolOptionsResponse {
   field: string;
@@ -95,6 +117,15 @@ export interface ToolOptionsResponse {
   deduplicated_count?: number;
   invalid_item_count?: number;
   conflict_count?: number;
+  search_supported?: boolean;
+  validation_supported?: boolean;
+  depends_on?: string[];
+  missing_dependencies?: string[];
+  min_query_length?: number;
+  next_cursor?: OptionCursor | null;
+  has_more?: boolean;
+  total?: number | null;
+  pagination_mode?: "page" | "offset" | "cursor" | string;
 }
 
 // 与后端 TaskOutcome 对齐(部分字段)
@@ -139,9 +170,13 @@ export async function invokeSkill(
   return data;
 }
 
-export async function listSkillOptions(skillId: string, field: string): Promise<ToolOptionsResponse> {
+export async function listSkillOptions(
+  skillId: string,
+  field: string,
+  request: ToolOptionsQuery = {},
+): Promise<ToolOptionsResponse> {
   const toolName = skillId.split(".").join("__");
-  const { data } = await api.post("/v1/tools/options", { name: toolName, field });
+  const { data } = await api.post("/v1/tools/options", { name: toolName, field, ...request });
   return data;
 }
 
