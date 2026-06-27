@@ -218,12 +218,12 @@ def _compiled_workflow() -> dict:
         "method": "POST",
         "url": "https://oa.example/api/leave/draft",
         "post_data": '{"draft":{"reason":"回家"}}',
-        "response_json": {"code": 0, "data": {"taskId": "T-1"}},
+        "response_json": {"code": 0, "data": {"taskId": "TASK-0001"}},
     }
     second = {
         "method": "POST",
         "url": "https://oa.example/api/leave/submit",
-        "post_data": '{"form":{"reason":"回家","taskId":"T-1"}}',
+        "post_data": '{"form":{"reason":"回家","taskId":"TASK-0001"}}',
         "response_json": {"code": 0},
     }
     ir = draft_ir()
