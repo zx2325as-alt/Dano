@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 
 import structlog
@@ -209,6 +210,12 @@ class RecordSession:
         self.steps: list[dict] = []
         self.requests: list[dict] = []      # 抓到的写请求(有序,method/url/post_data/headers)→ 参数化/多步工作流
         self.reads: list[dict] = []         # 抓到的读请求(GET+JSON 列表/字典)→ Q2 选领导等 select 的候选源
+        self.timeline: list[dict] = []      # P6: UI/network 真实交错时间线
+        self._timeline_seq = 0
+        self._request_seq = 0
+        self._last_ui_event_id: str | None = None
+        self._request_events: dict[int, dict] = {}
+        self._active_request: dict | None = None
         self._on_step = on_step
         self._on_request_cb = on_request    # 实时把抓到的请求推给前端(诊断可见)
         # 拦截提交:点提交时抓到业务写请求后,假装成功、不真发给服务器 → 录制不产生真实记录
@@ -221,6 +228,61 @@ class RecordSession:
         self._on_frame: Callable[[str], Awaitable[None]] | None = None   # 截屏回调(切活动页时复用)
         self._closing = False        # stop()/断连中:页面 close 事件不再重开截屏(避免在已关 context 上 new_cdp_session 抛错)
         self.page = None
+
+    def _record_timeline(self, event_type: str, payload: dict, *, request_id: str | None = None,
+                         parent_event_id: str | None = None) -> dict:
+        seq = self._timeline_seq
+        self._timeline_seq += 1
+        event = {
+            "event_id": f"cap-{seq:06d}",
+            "type": event_type,
+            "sequence": seq,
+            "monotonic_ns": time.monotonic_ns(),
+            "wall_time_ns": time.time_ns(),
+            "request_id": request_id,
+            "parent_event_id": parent_event_id,
+            "payload": payload,
+        }
+        self.timeline.append(event)
+        if event_type == "ui":
+            self._last_ui_event_id = event["event_id"]
+        return event
+
+    def _timeline_request(self, request) -> None:  # noqa: ANN001
+        try:
+            if getattr(request, "resource_type", "") not in ("xhr", "fetch"):
+                return
+            key = id(request)
+            if key in self._request_events:
+                return
+            from dano.execution.page.capture_bundle import content_hash
+            from dano.execution.page.request_capture import looks_like_auth_write, looks_like_read_request
+            method = (request.method or "GET").upper()
+            url = request.url or ""
+            post_data = request.post_data
+            role = "read"
+            if method in ("POST", "PUT", "PATCH", "DELETE"):
+                if looks_like_auth_write(url, post_data):
+                    role = "infra"
+                elif not looks_like_read_request(url, post_data):
+                    role = "write"
+            request_id = f"req-{self._request_seq:06d}"
+            self._request_seq += 1
+            event = self._record_timeline(
+                "network.request",
+                {"method": method, "url": url, "role": role,
+                 "has_body": post_data is not None,
+                 "body_hash": content_hash(post_data) if post_data is not None else ""},
+                request_id=request_id,
+                parent_event_id=self._last_ui_event_id,
+            )
+            self._request_events[key] = {
+                "request_id": request_id, "event_id": event["event_id"],
+                "sequence": event["sequence"], "role": role,
+                "method": method, "url": url,
+            }
+        except Exception:  # noqa: BLE001
+            pass
 
     async def start(self, start_url: str, *, base_url: str = "", headless: bool = True,
                     storage_state: str | None = None, token: str | None = None,
@@ -245,6 +307,7 @@ class RecordSession:
         # (Playwright 一个 Page 只管一个标签页;旧实现只挂在 self.page 上,用户点开 target=_blank/window.open
         #  的新页时,新页既没装录制绑定、又没被截屏 → 表现为"新页打不开"。挂到 context 后新页天然继承。)
         await self._context.expose_binding("__danoRecord", self._on_record)
+        self._context.on("request", self._timeline_request)
         if self._intercept:
             # 拦截模式:抓到业务写请求后假装成功、不真发 → 录制不产生真实记录(登录/校验码等放行)
             await self._context.route("**/*", self._route)
@@ -295,8 +358,25 @@ class RecordSession:
     def _capture(self, m: str, url: str, pd: str | None, ct: str, headers: dict | None = None) -> None:
         """登记一个写请求(含请求头,回放鉴权用)+ 实时推给前端诊断。"""
         if pd:
+            meta = self._active_request
+            if meta is None:
+                from dano.execution.page.capture_bundle import content_hash
+                request_id = f"req-{self._request_seq:06d}"
+                self._request_seq += 1
+                event = self._record_timeline(
+                    "network.request",
+                    {"method": m, "url": url, "role": "write", "content_type": ct,
+                     "has_body": True, "body_hash": content_hash(pd)},
+                    request_id=request_id,
+                    parent_event_id=self._last_ui_event_id,
+                )
+                meta = {"request_id": request_id, "event_id": event["event_id"],
+                        "sequence": event["sequence"], "role": "write", "method": m, "url": url}
             self.requests.append({"method": m, "url": url, "post_data": pd,
-                                  "content_type": ct, "headers": headers or {}})
+                                  "content_type": ct, "headers": headers or {},
+                                  "_capture_id": meta["request_id"],
+                                  "_request_event_id": meta["event_id"],
+                                  "_request_sequence": meta["sequence"]})
         if self._on_request_cb is not None:
             is_json = "json" in (ct or "").lower() or (pd or "").lstrip().startswith(("{", "["))
             try:
@@ -315,7 +395,11 @@ class RecordSession:
                 hd = dict(request.headers or {})
             except Exception:  # noqa: BLE001
                 pass
-            self._capture(m, request.url, request.post_data, hd.get("content-type", ""), hd)
+            self._active_request = self._request_events.get(id(request))
+            try:
+                self._capture(m, request.url, request.post_data, hd.get("content-type", ""), hd)
+            finally:
+                self._active_request = None
         except Exception:  # noqa: BLE001
             pass
 
@@ -350,7 +434,11 @@ class RecordSession:
                     hd = dict(request.headers or {})
                 except Exception:  # noqa: BLE001
                     pass
-                self._capture(m, url, pd, hd.get("content-type", ""), hd)
+                self._active_request = self._request_events.get(id(request))
+                try:
+                    self._capture(m, url, pd, hd.get("content-type", ""), hd)
+                finally:
+                    self._active_request = None
                 await route.fulfill(status=200, content_type="application/json",
                                     body=self._success_envelope())
                 return
@@ -366,6 +454,9 @@ class RecordSession:
 
     def captured_reads(self) -> list[dict]:
         return list(self.reads)
+
+    def captured_timeline(self) -> list[dict]:
+        return [dict(event) for event in self.timeline]
 
     def _resp_dispatch(self, response) -> None:  # noqa: ANN001 —— 同步快筛后再异步读 body
         try:
@@ -391,12 +482,27 @@ class RecordSession:
                 data = await response.json()
             except Exception:  # noqa: BLE001
                 return
+            meta = self._request_events.get(id(response.request))
+            response_event = self._record_timeline(
+                "network.response",
+                {"method": m, "url": url, "role": (meta or {}).get("role"),
+                 "content_type": ct, "status": response.status,
+                 "has_response": True,
+                 "response_hash": __import__("dano.execution.page.capture_bundle", fromlist=["content_hash"]).content_hash(data)},
+                request_id=(meta or {}).get("request_id"),
+                parent_event_id=(meta or {}).get("event_id"),
+            )
             if m in ("POST", "PUT", "PATCH"):
-                # 写请求的真实响应(taskId 等)→ 贴回第一个同 url、还没响应的已抓写请求,供 Q3 步间数据流发现
-                for r in self.requests:
-                    if r.get("url") == url and "response_json" not in r:
-                        r["response_json"] = data
-                        break
+                target = next((r for r in self.requests
+                               if meta and r.get("_capture_id") == meta.get("request_id")), None)
+                if target is None:
+                    target = next((r for r in self.requests
+                                   if r.get("url") == url and "response_json" not in r), None)
+                if target is not None:
+                    target["response_json"] = data
+                    target["status"] = response.status
+                    target["_response_event_id"] = response_event["event_id"]
+                    target["_response_sequence"] = response_event["sequence"]
                 # 不 return:有些系统用 POST 查"下拉/选人"列表(带过滤条件)→ 列表型响应也当 select 候选源
             if any(n in url.lower() for n in _READ_NOISE):    # 只跳静态/流(保留字典/列表接口)
                 return
@@ -407,7 +513,12 @@ class RecordSession:
                 return
             self.reads.append({"method": m, "url": url, "status": response.status,
                                "json": data if len(self.reads) < 60 else None,
-                               "count": len(items)})
+                               "count": len(items),
+                               "_capture_id": (meta or {}).get("request_id"),
+                               "_request_event_id": (meta or {}).get("event_id"),
+                               "_request_sequence": (meta or {}).get("sequence"),
+                               "_response_event_id": response_event["event_id"],
+                               "_response_sequence": response_event["sequence"]})
         except Exception:  # noqa: BLE001
             pass
 
@@ -416,6 +527,10 @@ class RecordSession:
             step = json.loads(payload)
         except Exception:  # noqa: BLE001
             return
+        event = self._record_timeline("ui", dict(step))
+        step["_capture_event_id"] = event["event_id"]
+        step["_capture_sequence"] = event["sequence"]
+        step["_observed_at_ns"] = event["monotonic_ns"]
         # 同一 locator 连续 fill/select/pick(用户改了又改/逐字符)→ 覆盖,只留最后一次
         if (self.steps and self.steps[-1].get("locator") == step.get("locator")
                 and step.get("op") in ("fill", "select", "pick")):
@@ -491,6 +606,14 @@ class RecordSession:
     def reset(self) -> None:
         """清空已录步骤(用户登录完后点「从这里开始录」,丢弃登录步骤,只留业务流程)。"""
         self.steps.clear()
+        self.requests.clear()
+        self.reads.clear()
+        self.timeline.clear()
+        self._timeline_seq = 0
+        self._request_seq = 0
+        self._last_ui_event_id = None
+        self._request_events.clear()
+        self._active_request = None
 
     async def storage_state(self) -> dict | None:
         """抓当前会话登录态快照(所有 cookie + localStorage),不管系统把 token 存哪。
